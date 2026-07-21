@@ -9,7 +9,7 @@ use lightpool_sdk::spot_events::{
 use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
 };
-use lightpool_sdk::{EventData, EventType, ExecutionStatus, TransactionEvent, VerifiedBlock};
+use lightpool_sdk::{EventData, EventType, ExecutionStatus, TransactionEvent, ReceiptBlock};
 use lightpool_sdk::lightpool_types::TransactionResult;
 use uuid::Uuid;
 
@@ -59,7 +59,7 @@ pub async fn process_block(
     book_store: &SharedBookStore,
     user_hub: &SharedUserEventHub,
     submit_wait: &SharedSubmitWaitRegistry,
-    block: VerifiedBlock,
+    block: ReceiptBlock,
 ) {
     for tx_result in &block.transaction_outputs {
         // Match submit_queue register key: SignedTransaction digest (tx + signature).
