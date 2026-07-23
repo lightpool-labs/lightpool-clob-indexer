@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::net::SocketAddr;
 
 use bytes::Bytes;

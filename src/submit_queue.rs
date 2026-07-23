@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};

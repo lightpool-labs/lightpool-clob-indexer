@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use serde::Serialize;
 
 use crate::domain::BookLevel;

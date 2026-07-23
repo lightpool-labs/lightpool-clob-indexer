@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use lightpool_sdk::event_contract_events::{
     EventContractBurnedEvent, EventContractCreatedEvent, EventContractMintedEvent,
     EventContractRedeemedEvent, EventContractResolvedEvent,

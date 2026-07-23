@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 pub fn slug_from_question(question: &str) -> String {
     let mut slug = String::new();
     let mut last_hyphen = false;

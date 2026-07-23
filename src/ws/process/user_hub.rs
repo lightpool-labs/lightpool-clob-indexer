@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, RwLock};

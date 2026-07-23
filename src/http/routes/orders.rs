@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},

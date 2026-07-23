@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use axum::extract::ws::Message;
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;

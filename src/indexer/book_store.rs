@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 

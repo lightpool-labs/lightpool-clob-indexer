@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use axum::{extract::State, routing::post, Json, Router};
 use lightpool_sdk::lightpool_types::SignedTransaction;
 

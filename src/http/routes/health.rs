@@ -1,3 +1,6 @@
+// Copyright (c) LightPool Labs
+// Author: xiaoyu1998
+
 use axum::{extract::State, routing::get, Json, Router};
 use serde_json::json;
 
