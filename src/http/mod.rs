@@ -13,6 +13,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/health", routes::health::router())
         .nest("/markets", routes::markets::router())
+        .nest("/vaults", routes::vaults::router())
         .nest("/spot", routes::spot::router())
         .nest("/accounts", routes::accounts::router())
         .nest("/orders", routes::orders::router())

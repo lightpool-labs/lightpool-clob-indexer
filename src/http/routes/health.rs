@@ -21,6 +21,7 @@ async fn ready(State(state): State<AppState>) -> AppResult<Json<serde_json::Valu
     let node_ok = state.chain.health_check().await?;
     let head = state.indexed_head.read().await.clone();
     let market_count = state.index.market_count().await;
+    let vault_count = state.index.vault_count().await;
 
     Ok(Json(json!({
         "status": if node_ok { "ready" } else { "degraded" },
@@ -31,6 +32,7 @@ async fn ready(State(state): State<AppState>) -> AppResult<Json<serde_json::Valu
             "digest": head.digest,
             "tx_count": head.tx_count,
             "market_count": market_count,
+            "vault_count": vault_count,
         },
     })))
 }

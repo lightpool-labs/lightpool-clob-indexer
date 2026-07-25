@@ -7,3 +7,4 @@ pub mod markets;
 pub mod orders;
 pub mod spot;
 pub mod tx;
+pub mod vaults;

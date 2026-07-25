@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::domain::{Market, MarketQuery, MarketSortOrder, Order};
+use crate::domain::{Market, MarketQuery, MarketSortOrder, Order, Vault, VaultQuery};
 use crate::spot_market::{chain_order_key, normalize_spot_market_key};
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +53,8 @@ struct IndexStoreInner {
     last_trade_price_by_spot: HashMap<String, u64>,
     orders: HashMap<Uuid, StoredOrder>,
     chain_order_index: HashMap<String, Uuid>,
+    vaults: HashMap<Uuid, Vault>,
+    vault_address_index: HashMap<String, Uuid>,
 }
 
 pub struct IndexStore {
@@ -70,6 +72,104 @@ impl IndexStore {
 
     pub async fn market_count(&self) -> usize {
         self.inner.read().await.markets.len()
+    }
+
+    pub async fn vault_count(&self) -> usize {
+        self.inner.read().await.vaults.len()
+    }
+
+    pub async fn query_vaults(&self, query: VaultQuery) -> (Vec<Vault>, usize) {
+        let inner = self.inner.read().await;
+        let mut vaults: Vec<Vault> = inner.vaults.values().cloned().collect();
+
+        if let Some(manager) = query.manager.as_deref() {
+            let manager = manager.trim().to_ascii_lowercase();
+            vaults.retain(|vault| vault.manager.trim().to_ascii_lowercase() == manager);
+        }
+
+        if !query.vault_addresses.is_empty() {
+            let allowed: HashSet<String> = query
+                .vault_addresses
+                .iter()
+                .map(|address| address.trim().to_ascii_lowercase())
+                .collect();
+            vaults.retain(|vault| {
+                allowed.contains(&vault.vault_address.trim().to_ascii_lowercase())
+            });
+        }
+
+        vaults.sort_by(|left, right| left.vault_address.cmp(&right.vault_address));
+
+        let total = vaults.len();
+        let offset = query.offset as usize;
+        let page = vaults
+            .into_iter()
+            .skip(offset)
+            .take(query.limit as usize)
+            .collect();
+
+        (page, total)
+    }
+
+    pub async fn get_vault(&self, id: Uuid) -> Option<Vault> {
+        self.inner.read().await.vaults.get(&id).cloned()
+    }
+
+    pub async fn get_vault_by_address(&self, vault_address: &str) -> Option<Vault> {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let inner = self.inner.read().await;
+        inner
+            .vault_address_index
+            .get(&key)
+            .and_then(|id| inner.vaults.get(id).cloned())
+    }
+
+    pub async fn upsert_vault(&self, vault: Vault) {
+        let mut inner = self.inner.write().await;
+        let key = vault.vault_address.trim().to_ascii_lowercase();
+        inner.vault_address_index.insert(key, vault.id);
+        inner.vaults.insert(vault.id, vault);
+    }
+
+    pub async fn update_vault_equity(&self, vault_address: &str, equity: &str) {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let mut inner = self.inner.write().await;
+        if let Some(id) = inner.vault_address_index.get(&key).copied() {
+            if let Some(vault) = inner.vaults.get_mut(&id) {
+                vault.equity = equity.to_string();
+            }
+        }
+    }
+
+    pub async fn update_vault_allow_deposit(&self, vault_address: &str, allow_deposit: bool) {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let mut inner = self.inner.write().await;
+        if let Some(id) = inner.vault_address_index.get(&key).copied() {
+            if let Some(vault) = inner.vaults.get_mut(&id) {
+                vault.allow_deposit = allow_deposit;
+            }
+        }
+    }
+
+    pub async fn update_vault_manager(&self, vault_address: &str, manager: &str) {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let mut inner = self.inner.write().await;
+        if let Some(id) = inner.vault_address_index.get(&key).copied() {
+            if let Some(vault) = inner.vaults.get_mut(&id) {
+                vault.manager = manager.to_string();
+            }
+        }
+    }
+
+    pub async fn mark_vault_closed(&self, vault_address: &str) {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let mut inner = self.inner.write().await;
+        if let Some(id) = inner.vault_address_index.get(&key).copied() {
+            if let Some(vault) = inner.vaults.get_mut(&id) {
+                vault.is_closed = true;
+                vault.allow_deposit = false;
+            }
+        }
     }
 
     pub async fn query_markets(&self, query: MarketQuery) -> (Vec<Market>, usize) {
@@ -526,5 +626,9 @@ pub fn new_head() -> SharedIndexedBlockHead {
 
 pub fn market_uuid(market_address: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, market_address.as_bytes())
+}
+
+pub fn vault_uuid(vault_address: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("vault:{vault_address}").as_bytes())
 }
 

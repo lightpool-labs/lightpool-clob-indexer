@@ -123,6 +123,9 @@ async fn run_once(
             Message::Error(err) => {
                 return Err(AppError::Internal(format!("ws error: {err}")));
             }
+            Message::ReceiptBlock(_) => {
+                // Indexer subscribes to NewBlocks only; ignore commit-stage receipts.
+            }
         }
     }
 

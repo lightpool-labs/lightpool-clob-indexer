@@ -12,7 +12,11 @@ use lightpool_sdk::spot_events::{
 use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
 };
-use lightpool_sdk::{EventData, EventType, ExecutionStatus, TransactionEvent, ReceiptBlock};
+use lightpool_sdk::vault_events::{
+    VaultClosedEvent, VaultCreatedEvent, VaultDepositedEvent,
+    VaultDepositPermissionUpdatedEvent, VaultManagerUpdatedEvent, VaultWithdrawnEvent,
+};
+use lightpool_sdk::{vault_account, EventData, EventType, ExecutionStatus, TransactionEvent, ReceiptBlock};
 use lightpool_sdk::lightpool_types::TransactionResult;
 use uuid::Uuid;
 
@@ -21,12 +25,12 @@ use crate::book_hydrate::{
     DEFAULT_BOOK_DEPTH,
 };
 use crate::chain::{format_price_pieces, format_token_amount};
-use crate::domain::{Market, Order};
+use crate::domain::{Market, Order, Vault};
 use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
 use super::book_store::SharedBookStore;
-use super::store::{market_uuid, SharedIndexStore};
+use super::store::{market_uuid, vault_uuid, SharedIndexStore};
 
 fn spot_market_from_event_contract(event: &TransactionEvent) -> Option<String> {
     event
@@ -127,6 +131,77 @@ pub async fn process_block(
                                     "Resolved",
                                 )
                                 .await;
+                        }
+                    }
+                }
+                "vault_created" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        match bincode::deserialize::<VaultCreatedEvent>(data) {
+                            Ok(created) => {
+                                index_vault_created(store, created).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to decode vault_created");
+                            }
+                        }
+                    }
+                }
+                "vault_deposited" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(deposited) = bincode::deserialize::<VaultDepositedEvent>(data) {
+                            store
+                                .update_vault_equity(
+                                    &deposited.vault.to_string(),
+                                    &format_token_amount(deposited.equity),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                "vault_withdrawn" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(withdrawn) = bincode::deserialize::<VaultWithdrawnEvent>(data) {
+                            store
+                                .update_vault_equity(
+                                    &withdrawn.vault.to_string(),
+                                    &format_token_amount(withdrawn.equity),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                "vault_manager_updated" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(updated) =
+                            bincode::deserialize::<VaultManagerUpdatedEvent>(data)
+                        {
+                            store
+                                .update_vault_manager(
+                                    &updated.vault.to_string(),
+                                    &updated.new_manager.to_string(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                "vault_deposit_permission_updated" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(updated) =
+                            bincode::deserialize::<VaultDepositPermissionUpdatedEvent>(data)
+                        {
+                            store
+                                .update_vault_allow_deposit(
+                                    &updated.vault.to_string(),
+                                    updated.allow_deposit,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                "vault_closed" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(closed) = bincode::deserialize::<VaultClosedEvent>(data) {
+                            store.mark_vault_closed(&closed.vault.to_string()).await;
                         }
                     }
                 }
@@ -517,6 +592,43 @@ fn format_event_detail(event: &TransactionEvent) -> String {
                 );
             }
         }
+        "vault_created" => {
+            if let Ok(e) = bincode::deserialize::<VaultCreatedEvent>(bytes) {
+                return format!(
+                    "vault_created: vault={} manager={} quote={} share={}",
+                    e.vault, e.manager, e.quote_token, e.share_token,
+                );
+            }
+        }
+        "vault_deposited" => {
+            if let Ok(e) = bincode::deserialize::<VaultDepositedEvent>(bytes) {
+                return format!(
+                    "vault_deposited: vault={} user={} amount={} shares={} equity={}",
+                    e.vault,
+                    e.user,
+                    format_token_amount(e.amount),
+                    format_token_amount(e.shares),
+                    format_token_amount(e.equity),
+                );
+            }
+        }
+        "vault_withdrawn" => {
+            if let Ok(e) = bincode::deserialize::<VaultWithdrawnEvent>(bytes) {
+                return format!(
+                    "vault_withdrawn: vault={} user={} amount={} shares={} equity={}",
+                    e.vault,
+                    e.user,
+                    format_token_amount(e.amount),
+                    format_token_amount(e.shares),
+                    format_token_amount(e.equity),
+                );
+            }
+        }
+        "vault_closed" => {
+            if let Ok(e) = bincode::deserialize::<VaultClosedEvent>(bytes) {
+                return format!("vault_closed: vault={}", e.vault);
+            }
+        }
         "token_created" => {
             if let Ok(e) = bincode::deserialize::<TokenCreatedEvent>(bytes) {
                 return format!(
@@ -748,6 +860,32 @@ async fn index_market_created(
         &market.no_spot_market,
     )
     .await;
+}
+
+async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEvent) {
+    let vault_address = created.vault.to_string();
+    let trading_account = vault_account(created.vault);
+    let vault = Vault {
+        id: vault_uuid(&vault_address),
+        vault_address: vault_address.clone(),
+        vault_account: trading_account.to_string(),
+        manager: created.manager.to_string(),
+        quote_token: created.quote_token.to_string(),
+        share_token: created.share_token.to_string(),
+        equity: "0".into(),
+        allow_deposit: true,
+        is_closed: false,
+    };
+
+    tracing::info!(
+        vault_id = %vault.id,
+        vault_address = %vault.vault_address,
+        vault_account = %vault.vault_account,
+        manager = %vault.manager,
+        "indexed vault"
+    );
+
+    store.upsert_vault(vault).await;
 }
 
 pub async fn index_order_created(

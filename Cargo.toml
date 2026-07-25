@@ -25,4 +25,4 @@ bytes = "1"
 dashmap = "5"
 tokio-util = { version = "0.7", features = ["codec"] }
 
-lightpool-sdk = { path = "../../crates/lightpool-sdk" }
+lightpool-sdk = { path = "../lightpool/crates/lightpool-sdk" }

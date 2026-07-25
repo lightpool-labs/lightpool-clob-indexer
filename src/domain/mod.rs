@@ -4,6 +4,7 @@
 mod book;
 mod market;
 mod order;
+mod vault;
 
 pub use book::{BookLevel, BookSnapshot};
 pub use market::{
@@ -11,3 +12,6 @@ pub use market::{
     MAX_MARKETS_PAGE_LIMIT, MAX_MARKETS_SLUG_BATCH,
 };
 pub use order::Order;
+pub use vault::{
+    Vault, VaultQuery, DEFAULT_VAULTS_PAGE_LIMIT, MAX_VAULTS_PAGE_LIMIT,
+};
