@@ -12,6 +12,8 @@ pub struct QueryVaultsParams {
     pub offset: Option<u32>,
     pub manager: Option<String>,
     pub vault_addresses: Option<String>,
+    /// Optional user address used to compute `user_deposit`.
+    pub account: Option<String>,
 }
 
 fn parse_csv(value: Option<String>) -> Vec<String> {

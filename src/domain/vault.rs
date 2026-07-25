@@ -24,6 +24,9 @@ pub struct Vault {
     pub quote_token: String,
     pub share_token: String,
     pub equity: String,
+    /// User's vault equity in quote units (shares * TVL / supply), for the queried account.
+    #[serde(default)]
+    pub user_deposit: String,
     #[serde(default)]
     pub portfolio: Vec<VaultAsset>,
     pub allow_deposit: bool,

@@ -3,7 +3,8 @@
 
 use lightpool_sdk::lightpool_types::call::{GetBalance, GetBalanceParams};
 use lightpool_sdk::lightpool_types::call::{
-    GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams,
+    GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams, GetTokenInfo,
+    GetTokenInfoParams,
 };
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
@@ -118,6 +119,31 @@ impl ChainClient {
 
         bincode::deserialize(&bytes)
             .map_err(|e| AppError::Internal(format!("decode GetMarket: {e}")))
+    }
+
+    pub async fn get_token_info(
+        &self,
+        account: Address,
+        token_contract: ContractAddress,
+    ) -> AppResult<GetTokenInfo> {
+        let action = ActionBuilder::get_token_info(token_contract, GetTokenInfoParams {})
+            .map_err(|e| AppError::Internal(format!("build get_token_info action: {e}")))?;
+
+        let call_tx = TransactionBuilder::new()
+            .account(account)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_token_info call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_token_info failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetTokenInfo: {e}")))
     }
 }
 
