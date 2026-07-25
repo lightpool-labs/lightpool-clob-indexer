@@ -17,6 +17,7 @@ pub struct VaultAsset {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub id: Uuid,
+    pub name: String,
     pub vault_address: String,
     pub vault_account: String,
     pub manager: String,

@@ -443,6 +443,19 @@ pub async fn process_block(
                                     filled.is_fully_filled,
                                 )
                                 .await;
+                            if let Some((_, user_address, _)) = store
+                                .stored_order_by_chain_id(&spot_market, &chain_order_id)
+                                .await
+                            {
+                                store
+                                    .apply_vault_fill_to_portfolio(
+                                        &user_address,
+                                        &spot_market,
+                                        filled.side,
+                                        filled.fill_amount,
+                                    )
+                                    .await;
+                            }
                             publish_user_order_filled(
                                 user_hub,
                                 store,
@@ -595,8 +608,8 @@ fn format_event_detail(event: &TransactionEvent) -> String {
         "vault_created" => {
             if let Ok(e) = bincode::deserialize::<VaultCreatedEvent>(bytes) {
                 return format!(
-                    "vault_created: vault={} manager={} quote={} share={}",
-                    e.vault, e.manager, e.quote_token, e.share_token,
+                    "vault_created: vault={} name={} manager={} quote={} share={}",
+                    e.vault, e.name, e.manager, e.quote_token, e.share_token,
                 );
             }
         }
@@ -867,6 +880,7 @@ async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEven
     let trading_account = vault_account(created.vault);
     let vault = Vault {
         id: vault_uuid(&vault_address),
+        name: created.name.to_string(),
         vault_address: vault_address.clone(),
         vault_account: trading_account.to_string(),
         manager: created.manager.to_string(),
@@ -880,6 +894,7 @@ async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEven
 
     tracing::info!(
         vault_id = %vault.id,
+        name = %vault.name,
         vault_address = %vault.vault_address,
         vault_account = %vault.vault_account,
         manager = %vault.manager,

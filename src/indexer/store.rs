@@ -55,6 +55,9 @@ struct IndexStoreInner {
     chain_order_index: HashMap<String, Uuid>,
     vaults: HashMap<Uuid, Vault>,
     vault_address_index: HashMap<String, Uuid>,
+    vault_account_index: HashMap<String, Uuid>,
+    /// Indexed vault spot holdings: vault_id -> spot_market -> base amount (raw).
+    vault_portfolio: HashMap<Uuid, HashMap<String, u64>>,
 }
 
 pub struct IndexStore {
@@ -126,9 +129,75 @@ impl IndexStore {
 
     pub async fn upsert_vault(&self, vault: Vault) {
         let mut inner = self.inner.write().await;
-        let key = vault.vault_address.trim().to_ascii_lowercase();
-        inner.vault_address_index.insert(key, vault.id);
+        let address_key = vault.vault_address.trim().to_ascii_lowercase();
+        let account_key = vault.vault_account.trim().to_ascii_lowercase();
+        inner.vault_address_index.insert(address_key, vault.id);
+        inner.vault_account_index.insert(account_key, vault.id);
+        inner.vault_portfolio.entry(vault.id).or_default();
         inner.vaults.insert(vault.id, vault);
+    }
+
+    pub async fn apply_vault_fill_to_portfolio(
+        &self,
+        user_address: &str,
+        spot_market: &str,
+        side: lightpool_sdk::OrderSide,
+        fill_amount: u64,
+    ) {
+        if fill_amount == 0 {
+            return;
+        }
+        let account_key = user_address.trim().to_ascii_lowercase();
+        let market_key = normalize_spot_market_key(spot_market);
+        let mut inner = self.inner.write().await;
+        let Some(vault_id) = inner.vault_account_index.get(&account_key).copied() else {
+            return;
+        };
+        let holdings = inner.vault_portfolio.entry(vault_id).or_default();
+        let current = holdings.get(&market_key).copied().unwrap_or(0);
+        let next = match side {
+            lightpool_sdk::OrderSide::Buy => current.saturating_add(fill_amount),
+            lightpool_sdk::OrderSide::Sell => {
+                if fill_amount > current {
+                    tracing::warn!(
+                        user_address,
+                        spot_market = %market_key,
+                        current,
+                        fill_amount,
+                        "vault portfolio sell underflow; clamping to zero"
+                    );
+                    0
+                } else {
+                    current - fill_amount
+                }
+            }
+        };
+        if next == 0 {
+            holdings.remove(&market_key);
+        } else {
+            holdings.insert(market_key, next);
+        }
+    }
+
+    pub async fn vault_portfolio_holdings(
+        &self,
+        vault_address: &str,
+    ) -> Vec<(String, u64)> {
+        let key = vault_address.trim().to_ascii_lowercase();
+        let inner = self.inner.read().await;
+        let Some(vault_id) = inner.vault_address_index.get(&key).copied() else {
+            return Vec::new();
+        };
+        let Some(holdings) = inner.vault_portfolio.get(&vault_id) else {
+            return Vec::new();
+        };
+        let mut assets: Vec<(String, u64)> = holdings
+            .iter()
+            .filter(|(_, amount)| **amount > 0)
+            .map(|(market, amount)| (market.clone(), *amount))
+            .collect();
+        assets.sort_by(|left, right| left.0.cmp(&right.0));
+        assets
     }
 
     pub async fn update_vault_equity(&self, vault_address: &str, equity: &str) {

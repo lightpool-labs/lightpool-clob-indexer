@@ -55,14 +55,13 @@ async fn enrich_vault_inner(
     vault: &Vault,
 ) -> AppResult<(String, Vec<VaultAsset>)> {
     let query_account = parse_address(&state.config.query_account)?;
-    let vault_contract = parse_contract(&vault.vault_address)?;
     let vault_account = parse_address(&vault.vault_account)?;
     let quote_token = parse_contract(&vault.quote_token)?;
 
-    let portfolio = state
-        .chain
-        .get_vault_portfolio(query_account, vault_contract)
-        .await?;
+    let holdings = state
+        .index
+        .vault_portfolio_holdings(&vault.vault_address)
+        .await;
 
     let quote_balance = state
         .chain
@@ -72,7 +71,7 @@ async fn enrich_vault_inner(
         .unwrap_or(0);
 
     let mut equity = quote_balance;
-    let mut assets = Vec::with_capacity(portfolio.assets.len() + 1);
+    let mut assets = Vec::with_capacity(holdings.len() + 1);
 
     let cash_amount = format_amount_2dp(quote_balance);
     assets.push(VaultAsset {
@@ -82,38 +81,35 @@ async fn enrich_vault_inner(
         quote_value: Some(cash_amount),
     });
 
-    for asset in portfolio.assets {
+    for (market, amount) in holdings {
         let mut last_price: Option<String> = None;
         let mut quote_value: Option<String> = None;
 
-        if asset.amount > 0 {
-            match state
-                .chain
-                .get_market_info(query_account, asset.market)
-                .await
-            {
-                Ok(info) => {
-                    if let Some(price) = info.last_price {
-                        let value = mul_quote(asset.amount, price);
-                        equity = equity.saturating_add(value);
-                        last_price = Some(format_amount_2dp(price));
-                        quote_value = Some(format_amount_2dp(value));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        vault = %vault.vault_address,
-                        market = %asset.market,
-                        error = %error,
-                        "failed to load market last_price for vault asset"
-                    );
-                }
+        if amount > 0 {
+            let price = match state.index.last_trade_price(&market).await {
+                Some(price) => Some(price),
+                None => match parse_contract(&market) {
+                    Ok(market_contract) => state
+                        .chain
+                        .get_market_info(query_account, market_contract)
+                        .await
+                        .ok()
+                        .and_then(|info| info.last_price),
+                    Err(_) => None,
+                },
+            };
+
+            if let Some(price) = price {
+                let value = mul_quote(amount, price);
+                equity = equity.saturating_add(value);
+                last_price = Some(format_amount_2dp(price));
+                quote_value = Some(format_amount_2dp(value));
             }
         }
 
         assets.push(VaultAsset {
-            market: asset.market.to_string(),
-            amount: format_amount_2dp(asset.amount),
+            market,
+            amount: format_amount_2dp(amount),
             last_price,
             quote_value,
         });
