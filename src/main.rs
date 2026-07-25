@@ -14,6 +14,7 @@ mod spot_market;
 mod state;
 mod submit_queue;
 mod submit_wait;
+mod vault_enrich;
 mod ws;
 
 use std::net::SocketAddr;

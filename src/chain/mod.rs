@@ -2,7 +2,10 @@
 // Author: xiaoyu1998
 
 use lightpool_sdk::lightpool_types::call::{GetBalance, GetBalanceParams};
-use lightpool_sdk::lightpool_types::call::{GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams};
+use lightpool_sdk::lightpool_types::call::{
+    GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams, GetVaultPortfolio,
+    GetVaultPortfolioParams,
+};
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
 use lightpool_sdk::{
@@ -116,6 +119,31 @@ impl ChainClient {
 
         bincode::deserialize(&bytes)
             .map_err(|e| AppError::Internal(format!("decode GetMarket: {e}")))
+    }
+
+    pub async fn get_vault_portfolio(
+        &self,
+        account: Address,
+        vault_contract: ContractAddress,
+    ) -> AppResult<GetVaultPortfolio> {
+        let action = ActionBuilder::get_vault_portfolio(vault_contract, GetVaultPortfolioParams {})
+            .map_err(|e| AppError::Internal(format!("build get_vault_portfolio action: {e}")))?;
+
+        let call_tx = TransactionBuilder::new()
+            .account(account)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_vault_portfolio call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_vault_portfolio failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetVaultPortfolio: {e}")))
     }
 }
 

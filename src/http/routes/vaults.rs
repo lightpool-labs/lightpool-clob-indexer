@@ -12,6 +12,7 @@ use crate::error::{AppError, AppResult};
 use crate::http::models::VaultsPageResponse;
 use crate::http::process::{build_vault_query, QueryVaultsParams};
 use crate::state::AppState;
+use crate::vault_enrich::{enrich_vault, enrich_vaults};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -27,6 +28,7 @@ async fn query_vaults(
     let limit = query.limit;
     let offset = query.offset;
     let (vaults, total) = state.index.query_vaults(query).await;
+    let vaults = enrich_vaults(&state, vaults).await;
 
     Ok(Json(VaultsPageResponse {
         vaults,
@@ -40,10 +42,10 @@ async fn get_vault_by_address(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> AppResult<Json<Vault>> {
-    state
+    let vault = state
         .index
         .get_vault_by_address(&address)
         .await
-        .ok_or_else(|| AppError::NotFound(format!("vault {address} not found")))
-        .map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("vault {address} not found")))?;
+    Ok(Json(enrich_vault(&state, vault).await))
 }

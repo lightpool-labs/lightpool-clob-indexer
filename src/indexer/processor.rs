@@ -873,6 +873,7 @@ async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEven
         quote_token: created.quote_token.to_string(),
         share_token: created.share_token.to_string(),
         equity: "0".into(),
+        portfolio: Vec::new(),
         allow_deposit: true,
         is_closed: false,
     };

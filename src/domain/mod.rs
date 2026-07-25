@@ -13,5 +13,5 @@ pub use market::{
 };
 pub use order::Order;
 pub use vault::{
-    Vault, VaultQuery, DEFAULT_VAULTS_PAGE_LIMIT, MAX_VAULTS_PAGE_LIMIT,
+    Vault, VaultAsset, VaultQuery, DEFAULT_VAULTS_PAGE_LIMIT, MAX_VAULTS_PAGE_LIMIT,
 };
