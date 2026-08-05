@@ -15,7 +15,7 @@ pub async fn handle_subscribe(
     sender: &mut SplitSink<axum::extract::ws::WebSocket, Message>,
     session: &mut WsSession,
     spot_market: &str,
-    _depth: u32,
+    depth: u32,
 ) -> bool {
     if let Err(error) = rehydrate_spot_from_chain(
         &state.chain,
@@ -23,6 +23,7 @@ pub async fn handle_subscribe(
         &state.index,
         &state.config.query_account,
         spot_market,
+        depth,
     )
     .await
     {
@@ -32,7 +33,7 @@ pub async fn handle_subscribe(
         return true;
     }
 
-    if let Some(snapshot) = state.book_store.ws_snapshot(spot_market, _depth).await {
+    if let Some(snapshot) = state.book_store.ws_snapshot(spot_market, depth).await {
         let text = serde_json::to_string(&snapshot).unwrap_or_default();
         if sender.send(Message::Text(text.into())).await.is_err() {
             return false;
@@ -44,7 +45,7 @@ pub async fn handle_subscribe(
         spot_market.to_string(),
         rx,
         state.book_store.clone(),
-        _depth,
+        depth,
     );
 
     let _ = sender

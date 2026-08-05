@@ -5,7 +5,7 @@ use axum::extract::ws::Message;
 use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
 
-use crate::book_hydrate::rehydrate_spot_from_chain;
+use crate::book_hydrate::{rehydrate_spot_from_chain, DEFAULT_BOOK_DEPTH};
 use crate::state::AppState;
 use crate::ws::models::{ws_error, ws_subscribed, ws_unsubscribed, CHANNEL_QUOTE};
 use crate::ws::process::WsSession;
@@ -22,6 +22,7 @@ pub async fn handle_subscribe(
         &state.index,
         &state.config.query_account,
         spot_market,
+        DEFAULT_BOOK_DEPTH,
     )
     .await
     {

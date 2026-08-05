@@ -5,6 +5,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use lightpool_sdk::{parse_token_contract, Address};
+use lightpool_sdk::lightpool_types::call::GetOrderBook;
+use lightpool_sdk::ContractAddress;
 
 use crate::chain::ChainClient;
 use crate::error::{AppError, AppResult};
@@ -36,7 +38,7 @@ pub async fn hydrate_spot_from_chain(
         .map_err(|e| AppError::BadRequest(format!("invalid spot market: {e}")))?;
 
     let depth = depth.clamp(1, DEFAULT_BOOK_DEPTH);
-    let chain_book = chain.get_book(account, spot, depth).await?;
+    let chain_book = get_book_with_depth_fallback(chain, account, spot, depth).await?;
     let last_trade_price = if let Some(price) = index.last_trade_price(spot_market).await {
         Some(price)
     } else {
@@ -56,6 +58,38 @@ pub async fn hydrate_spot_from_chain(
     );
 
     Ok(())
+}
+
+async fn get_book_with_depth_fallback(
+    chain: &ChainClient,
+    account: Address,
+    spot: ContractAddress,
+    depth: u32,
+) -> AppResult<GetOrderBook> {
+    let mut attempt_depth = depth;
+    loop {
+        match chain.get_book(account, spot, attempt_depth).await {
+            Ok(book) => {
+                if attempt_depth < depth {
+                    tracing::warn!(
+                        requested_depth = depth,
+                        used_depth = attempt_depth,
+                        "get_book failed at higher depth; hydrated with reduced depth"
+                    );
+                }
+                return Ok(book);
+            }
+            Err(error) if attempt_depth > 10 => {
+                tracing::warn!(
+                    depth = attempt_depth,
+                    error = %error,
+                    "get_book failed; retrying with smaller depth"
+                );
+                attempt_depth = (attempt_depth / 2).max(10);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub async fn ensure_chain_hydrated(
@@ -78,6 +112,7 @@ pub async fn rehydrate_spot_from_chain(
     index: &SharedIndexStore,
     query_account: &str,
     spot_market: &str,
+    depth: u32,
 ) -> AppResult<()> {
     hydrate_spot_from_chain(
         chain,
@@ -85,7 +120,7 @@ pub async fn rehydrate_spot_from_chain(
         index,
         query_account,
         spot_market,
-        DEFAULT_BOOK_DEPTH,
+        depth,
     )
     .await
 }
