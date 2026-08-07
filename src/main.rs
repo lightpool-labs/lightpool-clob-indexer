@@ -9,6 +9,8 @@ mod error;
 mod http;
 mod indexer;
 mod mempool_client;
+mod peer;
+mod persist;
 mod slug;
 mod spot_market;
 mod state;
@@ -40,6 +42,30 @@ async fn main() {
     let config = Config::from_env();
     let state = AppState::new(config.clone());
 
+    if let Some(persist) = &state.persist {
+        match indexer::recover_from_persist(
+            persist,
+            &state.chain,
+            &config.query_account,
+            &state.index,
+            &state.book_store,
+            &state.user_hub,
+            &state.submit_wait,
+        )
+        .await
+        {
+            Ok(Some(meta)) => {
+                let mut head = state.indexed_head.write().await;
+                head.block_num = meta.block_num;
+                head.digest = meta.digest;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(error = %error, "failed to recover state from sqlite");
+            }
+        }
+    }
+
     if config.enable_indexer {
         let ws_url = config.lightpool_ws_url.clone();
         let chain = state.chain.clone();
@@ -48,6 +74,16 @@ async fn main() {
         let index = state.index.clone();
         let book_store = state.book_store.clone();
         let user_hub = state.user_hub.clone();
+        let persist = state.persist.clone();
+        let apply_gate = persist.as_ref().map(|_| indexer::new_apply_gate());
+        let peer_catchup = if config.peer_index_urls.is_empty() {
+            None
+        } else {
+            Some(indexer::PeerCatchupConfig {
+                peer_urls: config.peer_index_urls.clone(),
+                threshold: config.peer_catchup_threshold,
+            })
+        };
         let _indexer_handle = indexer::spawn(
             ws_url,
             chain,
@@ -57,8 +93,26 @@ async fn main() {
             book_store,
             user_hub,
             state.submit_wait.clone(),
+            persist.clone(),
+            apply_gate.clone(),
+            peer_catchup,
         );
         tracing::info!("block indexer started");
+
+        if let (Some(persist), Some(apply_gate)) = (persist, apply_gate) {
+            let _checkpoint_handle = indexer::spawn_checkpoint_worker(
+                config.checkpoint_interval_ms,
+                persist,
+                state.indexed_head.clone(),
+                state.index.clone(),
+                state.book_store.clone(),
+                apply_gate,
+            );
+            tracing::info!(
+                interval_ms = config.checkpoint_interval_ms,
+                "periodic sqlite checkpoint worker started"
+            );
+        }
     } else {
         tracing::info!("block indexer disabled");
     }

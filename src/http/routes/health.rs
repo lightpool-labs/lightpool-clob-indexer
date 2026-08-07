@@ -24,10 +24,11 @@ async fn ready(State(state): State<AppState>) -> AppResult<Json<serde_json::Valu
     let vault_count = state.index.vault_count().await;
 
     Ok(Json(json!({
-        "status": if node_ok { "ready" } else { "degraded" },
+        "status": if node_ok && !head.catching_up { "ready" } else { "degraded" },
         "node": node_ok,
         "indexer": {
             "connected": head.connected,
+            "catching_up": head.catching_up,
             "block_num": head.block_num,
             "digest": head.digest,
             "tx_count": head.tx_count,

@@ -6,8 +6,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use lightpool_sdk::spot_events::OrderCreatedEvent;
+use lightpool_sdk::lightpool_types::{Address, ContractAddress};
+use lightpool_sdk::parse_token_contract;
+use lightpool_sdk::spot_events::{OrderCreatedEvent, OrderEventType};
+use lightpool_sdk::{OrderId, OrderSide};
 use serde::Deserialize;
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::domain::Order;
@@ -19,7 +23,7 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 struct IndexFromEventRequest {
-    event: OrderCreatedEvent,
+    event: WireOrderCreatedEvent,
     #[serde(default)]
     skip_book: bool,
     #[serde(default = "default_open_status")]
@@ -28,8 +32,70 @@ struct IndexFromEventRequest {
     filled_raw: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct WireOrderCreatedEvent {
+    order_id: OrderId,
+    side: OrderSide,
+    amount: u64,
+    creator: FlexibleAddress,
+    market: FlexibleAddress,
+    order_type: OrderEventType,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FlexibleAddress {
+    Hex(String),
+    Bytes(Vec<u8>),
+}
+
 fn default_open_status() -> String {
     "open".into()
+}
+
+fn parse_flexible_address(value: FlexibleAddress) -> AppResult<Address> {
+    match value {
+        FlexibleAddress::Hex(raw) => {
+            let trimmed = raw.trim();
+            if let Ok(address) = Address::from_str(trimmed) {
+                return Ok(address);
+            }
+            if let Ok(contract) = parse_token_contract(trimmed) {
+                return Ok(contract.to_address());
+            }
+            Err(AppError::BadRequest(format!(
+                "invalid address `{trimmed}`"
+            )))
+        }
+        FlexibleAddress::Bytes(bytes) => {
+            if bytes.len() == Address::ADDRESS_LENGTH {
+                Address::from_slice(&bytes)
+                    .map_err(|e| AppError::BadRequest(format!("invalid address bytes: {e}")))
+            } else if bytes.len() == ContractAddress::CONTRACT_ADDRESS_LENGTH {
+                let mut arr = [0u8; ContractAddress::CONTRACT_ADDRESS_LENGTH];
+                arr.copy_from_slice(&bytes);
+                Ok(ContractAddress::from_bytes(arr).to_address())
+            } else {
+                Err(AppError::BadRequest(format!(
+                    "invalid address byte length {}",
+                    bytes.len()
+                )))
+            }
+        }
+    }
+}
+
+impl WireOrderCreatedEvent {
+    fn into_event(self) -> AppResult<OrderCreatedEvent> {
+        Ok(OrderCreatedEvent {
+            order_id: self.order_id,
+            side: self.side,
+            amount: self.amount,
+            creator: parse_flexible_address(self.creator)?,
+            market: parse_flexible_address(self.market)?,
+            order_type: self.order_type,
+        })
+    }
 }
 
 pub fn router() -> Router<AppState> {
@@ -202,7 +268,7 @@ async fn index_from_event(
         }
     };
 
-    let event = request.event;
+    let event = request.event.into_event()?;
     let chain_order_id = event.order_id.to_string();
     let spot_market = normalize_spot_market_key(&event.market.to_string());
     let is_new = !state

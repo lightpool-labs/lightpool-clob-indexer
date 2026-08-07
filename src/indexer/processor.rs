@@ -2,8 +2,8 @@
 // Author: xiaoyu1998
 
 use lightpool_sdk::event_contract_events::{
-    EventContractBurnedEvent, EventContractCreatedEvent, EventContractMintedEvent,
-    EventContractRedeemedEvent, EventContractResolvedEvent,
+    EventContractBurnedEvent, EventContractClosedEvent, EventContractCreatedEvent,
+    EventContractMintedEvent, EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
     OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent, OrderUpdatedEvent,
@@ -129,6 +129,20 @@ pub async fn process_block(
                                 .update_market_state(
                                     &resolved.market_address.to_string(),
                                     "Resolved",
+                                )
+                                .await;
+                        }
+                    }
+                }
+                "event_contract_closed" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        if let Ok(closed) =
+                            bincode::deserialize::<EventContractClosedEvent>(data)
+                        {
+                            store
+                                .update_market_state(
+                                    &closed.market_address.to_string(),
+                                    "Closed",
                                 )
                                 .await;
                         }
@@ -478,7 +492,7 @@ pub async fn process_block(
     }
 
     if sync_stats.created_total > 0 || sync_stats.skipped_duplicates > 0 {
-        tracing::warn!(
+        tracing::debug!(
             block_num,
             created_total = sync_stats.created_total,
             created_yes = sync_stats.created_yes,
@@ -593,6 +607,11 @@ fn format_event_detail(event: &TransactionEvent) -> String {
                     "event_contract_resolved: market={} outcome={}",
                     e.market_address, e.outcome
                 );
+            }
+        }
+        "event_contract_closed" => {
+            if let Ok(e) = bincode::deserialize::<EventContractClosedEvent>(bytes) {
+                return format!("event_contract_closed: market={}", e.market_address);
             }
         }
         "event_contract_redeemed" => {
@@ -768,7 +787,7 @@ async fn log_block_sync_order_created(
         lightpool_sdk::OrderSide::Sell => "sell",
     };
 
-    tracing::warn!(
+    tracing::debug!(
         block_num,
         order_id = %created.order_id,
         slug = slug.as_deref().unwrap_or("-"),

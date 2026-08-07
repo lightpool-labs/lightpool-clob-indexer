@@ -16,6 +16,7 @@ pub struct IndexedBlockHead {
     pub digest: String,
     pub tx_count: usize,
     pub connected: bool,
+    pub catching_up: bool,
 }
 
 pub type SharedIndexedBlockHead = Arc<RwLock<IndexedBlockHead>>;
@@ -73,8 +74,97 @@ impl IndexStore {
         }
     }
 
+    pub async fn clear_all(&self) {
+        *self.inner.write().await = IndexStoreInner::default();
+    }
+
     pub async fn market_count(&self) -> usize {
         self.inner.read().await.markets.len()
+    }
+
+    pub async fn export_markets_for_persist(&self) -> Vec<Market> {
+        self.inner.read().await.markets.values().cloned().collect()
+    }
+
+    pub async fn export_orders_for_persist(&self) -> Vec<crate::persist::PersistOrderRow> {
+        let inner = self.inner.read().await;
+        let mut out = Vec::new();
+        for stored in inner.orders.values() {
+            let Some(market) = inner.markets.get(&stored.order.market_id) else {
+                continue;
+            };
+            let spot_market = if stored.order.outcome == "yes" {
+                market.yes_spot_market.clone()
+            } else {
+                market.no_spot_market.clone()
+            };
+            out.push(crate::persist::PersistOrderRow {
+                order: stored.order.clone(),
+                user_address: stored.user_address.clone(),
+                chain_order_id: stored.chain_order_id.clone(),
+                spot_market,
+                size_raw: stored.size_raw,
+                filled_raw: stored.filled_raw,
+            });
+        }
+        out
+    }
+
+    pub async fn export_last_trades_for_persist(&self) -> Vec<(String, u64)> {
+        self.inner
+            .read()
+            .await
+            .last_trade_price_by_spot
+            .iter()
+            .map(|(spot, price)| (spot.clone(), *price))
+            .collect()
+    }
+
+    pub async fn export_vaults_for_persist(&self) -> Vec<Vault> {
+        self.inner.read().await.vaults.values().cloned().collect()
+    }
+
+    pub async fn export_vault_portfolio_for_persist(
+        &self,
+    ) -> Vec<crate::persist::PersistVaultPortfolioRow> {
+        let inner = self.inner.read().await;
+        let mut out = Vec::new();
+        for (vault_id, holdings) in &inner.vault_portfolio {
+            for (spot_market, amount_raw) in holdings {
+                if *amount_raw == 0 {
+                    continue;
+                }
+                out.push(crate::persist::PersistVaultPortfolioRow {
+                    vault_id: vault_id.to_string(),
+                    spot_market: spot_market.clone(),
+                    amount_raw: *amount_raw,
+                });
+            }
+        }
+        out
+    }
+
+    pub async fn import_vault_portfolio_for_persist(
+        &self,
+        rows: Vec<crate::persist::PersistVaultPortfolioRow>,
+    ) {
+        let mut inner = self.inner.write().await;
+        inner.vault_portfolio.clear();
+        for row in rows {
+            let Ok(vault_id) = Uuid::parse_str(&row.vault_id) else {
+                tracing::warn!(vault_id = %row.vault_id, "skip vault portfolio row with bad id");
+                continue;
+            };
+            let spot = normalize_spot_market_key(&row.spot_market);
+            if row.amount_raw == 0 {
+                continue;
+            }
+            inner
+                .vault_portfolio
+                .entry(vault_id)
+                .or_default()
+                .insert(spot, row.amount_raw);
+        }
     }
 
     pub async fn vault_count(&self) -> usize {

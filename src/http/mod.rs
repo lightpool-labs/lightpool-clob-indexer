@@ -18,5 +18,6 @@ pub fn router() -> Router<AppState> {
         .nest("/accounts", routes::accounts::router())
         .nest("/orders", routes::orders::router())
         .nest("/tx", routes::tx::router())
+        .nest("/peer", routes::peer::router())
         .nest("/ws", crate::ws::router())
 }

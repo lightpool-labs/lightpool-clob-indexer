@@ -10,6 +10,7 @@ use crate::indexer::{
     BookStore, IndexStore, SharedBookStore, SharedIndexStore, SharedIndexedBlockHead, new_head,
 };
 use crate::mempool_client::MempoolClient;
+use crate::persist::SharedPersist;
 use crate::submit_queue::{SubmitQueue, SubmitQueueConfig};
 use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::{SharedUserEventHub, UserEventHub};
@@ -24,6 +25,7 @@ pub struct AppState {
     pub index: SharedIndexStore,
     pub book_store: SharedBookStore,
     pub user_hub: SharedUserEventHub,
+    pub persist: Option<SharedPersist>,
 }
 
 impl AppState {
@@ -40,6 +42,16 @@ impl AppState {
                 wait_timeout: Duration::from_millis(config.submit_wait_timeout_ms),
             },
         );
+
+        let persist = if config.enable_sqlite {
+            Some(
+                SharedPersist::open(&config.sqlite_path)
+                    .expect("failed to open SQLITE_PATH"),
+            )
+        } else {
+            None
+        };
+
         Self {
             config,
             chain,
@@ -49,6 +61,7 @@ impl AppState {
             index: Arc::new(IndexStore::new()),
             book_store: Arc::new(BookStore::new()),
             user_hub: Arc::new(UserEventHub::new()),
+            persist,
         }
     }
 }

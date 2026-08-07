@@ -44,6 +44,77 @@ impl BookStore {
         }
     }
 
+    pub async fn export_for_persist(
+        &self,
+    ) -> (
+        Vec<crate::persist::PersistBookLevel>,
+        Vec<crate::persist::PersistBookMeta>,
+    ) {
+        let inner = self.inner.read().await;
+        let mut levels = Vec::new();
+        let mut metas = Vec::new();
+        for (spot_market, book) in &inner.books {
+            metas.push(crate::persist::PersistBookMeta {
+                spot_market: spot_market.clone(),
+                sequence: book.sequence,
+                last_trade_price: book.last_trade_price,
+            });
+            for (price_raw, size_raw) in &book.bids {
+                levels.push(crate::persist::PersistBookLevel {
+                    spot_market: spot_market.clone(),
+                    side: "buy".into(),
+                    price_raw: *price_raw,
+                    size_raw: *size_raw,
+                });
+            }
+            for (price_raw, size_raw) in &book.asks {
+                levels.push(crate::persist::PersistBookLevel {
+                    spot_market: spot_market.clone(),
+                    side: "sell".into(),
+                    price_raw: *price_raw,
+                    size_raw: *size_raw,
+                });
+            }
+        }
+        (levels, metas)
+    }
+
+    pub async fn import_from_persist(
+        &self,
+        levels: Vec<crate::persist::PersistBookLevel>,
+        metas: Vec<crate::persist::PersistBookMeta>,
+    ) {
+        let mut inner = self.inner.write().await;
+        inner.books.clear();
+        inner.chain_hydrated.clear();
+
+        for meta in metas {
+            let key = Self::key(&meta.spot_market);
+            let book = inner.books.entry(key.clone()).or_insert_with(SpotBook::default);
+            book.sequence = meta.sequence;
+            book.last_trade_price = meta.last_trade_price;
+            inner.chain_hydrated.insert(key);
+        }
+
+        for level in levels {
+            if level.size_raw == 0 {
+                continue;
+            }
+            let key = Self::key(&level.spot_market);
+            let book = inner.books.entry(key.clone()).or_insert_with(SpotBook::default);
+            match level.side.as_str() {
+                "buy" => {
+                    book.bids.insert(level.price_raw, level.size_raw);
+                }
+                "sell" => {
+                    book.asks.insert(level.price_raw, level.size_raw);
+                }
+                _ => {}
+            }
+            inner.chain_hydrated.insert(key);
+        }
+    }
+
     fn key(spot_market: &str) -> String {
         normalize_spot_market_key(spot_market)
     }
