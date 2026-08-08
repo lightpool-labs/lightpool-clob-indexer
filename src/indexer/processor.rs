@@ -66,6 +66,7 @@ pub async fn process_block(
     book_store: &SharedBookStore,
     user_hub: &SharedUserEventHub,
     submit_wait: &SharedSubmitWaitRegistry,
+    bar_store: Option<&crate::bars::SharedBarStore>,
     block: ReceiptBlock,
 ) {
     for tx_result in &block.transaction_outputs {
@@ -421,6 +422,19 @@ pub async fn process_block(
                             store
                                 .record_last_trade_price(&spot_market, filled.price)
                                 .await;
+                            if let Some(bar_store) = bar_store {
+                                // Count buy-side fills only to avoid double-counting a match.
+                                if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
+                                    bar_store
+                                        .on_trade(
+                                            &spot_market,
+                                            filled.price,
+                                            filled.fill_amount,
+                                            crate::bars::BarStore::now_ts(),
+                                        )
+                                        .await;
+                                }
+                            }
                             if let Err(error) = ensure_chain_hydrated(
                                 chain,
                                 book_store,

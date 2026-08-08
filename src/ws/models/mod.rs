@@ -9,7 +9,7 @@ mod user;
 pub use orderbook::{BookLevelDelta, OrderBookDelta, OrderBookSnapshot};
 pub use quote::{QuoteDelta, QuoteSnapshot};
 pub use request::{
-    ws_error, ws_subscribed, ws_unsubscribed, WsRequest, CHANNEL_ORDERBOOK_DELTA, CHANNEL_QUOTE,
-    CHANNEL_USER,
+    ws_error, ws_subscribed, ws_unsubscribed, WsRequest, CHANNEL_BARS, CHANNEL_ORDERBOOK_DELTA,
+    CHANNEL_QUOTE, CHANNEL_USER,
 };
 pub use user::{UserOrderMessage, UserTradeMessage, UserWsMessage};

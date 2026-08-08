@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use crate::state::AppState;
 
 use models::{
-    ws_error, WsRequest, CHANNEL_ORDERBOOK_DELTA, CHANNEL_QUOTE, CHANNEL_USER,
+    ws_error, WsRequest, CHANNEL_BARS, CHANNEL_ORDERBOOK_DELTA, CHANNEL_QUOTE, CHANNEL_USER,
 };
 use process::WsSession;
 
@@ -139,6 +139,24 @@ async fn handle_request(
                     };
                     process::subscribe_user(state, sender, session, &user_address).await
                 }
+                CHANNEL_BARS => {
+                    let Some(spot_market) =
+                        request.spot_market.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing spot_market").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_bars(
+                        state,
+                        sender,
+                        session,
+                        &spot_market,
+                        request.interval.as_deref(),
+                    )
+                    .await
+                }
                 _ => {
                     let _ = sender
                         .send(Message::Text(
@@ -174,6 +192,13 @@ async fn handle_request(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty());
                     process::unsubscribe_user(sender, session, user_address).await;
+                }
+                CHANNEL_BARS => {
+                    let spot_market = request
+                        .spot_market
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_bars(sender, session, spot_market).await;
                 }
                 _ => {}
             }

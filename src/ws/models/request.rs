@@ -6,6 +6,7 @@ use serde::Deserialize;
 pub const CHANNEL_ORDERBOOK_DELTA: &str = "orderbook_delta";
 pub const CHANNEL_QUOTE: &str = "quote";
 pub const CHANNEL_USER: &str = "user";
+pub const CHANNEL_BARS: &str = "bars";
 
 #[derive(Debug, Deserialize)]
 pub struct WsRequest {
@@ -14,6 +15,7 @@ pub struct WsRequest {
     pub spot_market: Option<String>,
     pub user_address: Option<String>,
     pub depth: Option<u32>,
+    pub interval: Option<String>,
 }
 
 pub fn ws_error(message: impl Into<String>) -> String {

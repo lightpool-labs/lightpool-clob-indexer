@@ -10,12 +10,14 @@ use tokio::task::JoinHandle;
 use crate::indexer::SharedBookStore;
 use crate::spot_market::normalize_spot_market_key;
 use crate::ws::models::{OrderBookDelta, QuoteDelta, UserWsMessage};
+use crate::bars::BarWsMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SubscriptionKey {
     Orderbook(String),
     Quote(String),
     User(String),
+    Bars(String),
 }
 
 pub struct WsSession {
@@ -131,6 +133,30 @@ impl WsSession {
         self.tasks.insert(SubscriptionKey::User(user_address), handle);
     }
 
+    pub fn subscribe_bars(
+        &mut self,
+        spot_market: String,
+        mut rx: broadcast::Receiver<BarWsMessage>,
+    ) {
+        self.cancel(SubscriptionKey::Bars(spot_market.clone()));
+        let outbound = self.outbound.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(bar) => {
+                        let text = serde_json::to_string(&bar).unwrap_or_default();
+                        if outbound.send(Message::Text(text.into())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+        self.tasks.insert(SubscriptionKey::Bars(spot_market), handle);
+    }
+
     pub fn cancel(&mut self, key: SubscriptionKey) {
         if let Some(handle) = self.tasks.remove(&key) {
             handle.abort();
@@ -157,10 +183,16 @@ impl WsSession {
                 {
                     true
                 }
+                ("bars", Some(spot_market), SubscriptionKey::Bars(current))
+                    if current.eq_ignore_ascii_case(spot_market) =>
+                {
+                    true
+                }
                 (channel, None, subscription) => match channel {
                     "orderbook_delta" => matches!(subscription, SubscriptionKey::Orderbook(_)),
                     "quote" => matches!(subscription, SubscriptionKey::Quote(_)),
                     "user" => matches!(subscription, SubscriptionKey::User(_)),
+                    "bars" => matches!(subscription, SubscriptionKey::Bars(_)),
                     _ => false,
                 },
                 _ => false,

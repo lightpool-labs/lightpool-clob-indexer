@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bars::{BarStore, SharedBarStore};
 use crate::chain::ChainClient;
 use crate::config::Config;
 use crate::indexer::{
@@ -26,6 +27,7 @@ pub struct AppState {
     pub book_store: SharedBookStore,
     pub user_hub: SharedUserEventHub,
     pub persist: Option<SharedPersist>,
+    pub bar_store: SharedBarStore,
 }
 
 impl AppState {
@@ -51,6 +53,7 @@ impl AppState {
         } else {
             None
         };
+        let bar_store = Arc::new(BarStore::new(persist.clone()));
 
         Self {
             config,
@@ -62,6 +65,7 @@ impl AppState {
             book_store: Arc::new(BookStore::new()),
             user_hub: Arc::new(UserEventHub::new()),
             persist,
+            bar_store,
         }
     }
 }

@@ -2,6 +2,7 @@
 // Author: xiaoyu1998
 
 mod book_hydrate;
+mod bars;
 mod chain;
 mod config;
 mod domain;
@@ -84,6 +85,7 @@ async fn main() {
                 threshold: config.peer_catchup_threshold,
             })
         };
+        let bar_store = state.bar_store.clone();
         let _indexer_handle = indexer::spawn(
             ws_url,
             chain,
@@ -96,8 +98,20 @@ async fn main() {
             persist.clone(),
             apply_gate.clone(),
             peer_catchup,
+            bar_store.clone(),
         );
         tracing::info!("block indexer started");
+
+        let bar_store_closer = bar_store.clone();
+        let _bar_close_handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                bar_store_closer
+                    .close_expired(crate::bars::BarStore::now_ts())
+                    .await;
+            }
+        });
 
         if let (Some(persist), Some(apply_gate)) = (persist, apply_gate) {
             let _checkpoint_handle = indexer::spawn_checkpoint_worker(

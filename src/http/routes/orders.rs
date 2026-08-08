@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::domain::Order;
 use crate::error::{AppError, AppResult};
-use crate::http::models::{CancelContextResponse, OrderQueryResponse};
+use crate::http::models::{CancelContextResponse, ListedOrder, OrderQueryResponse};
 use crate::indexer::{apply_order_created_to_book, index_order_created, publish_user_order_created};
 use crate::spot_market::normalize_spot_market_key;
 use crate::state::AppState;
@@ -130,26 +130,38 @@ pub struct QueryOrderQuery {
 async fn list_orders(
     State(state): State<AppState>,
     Query(query): Query<ListOrdersQuery>,
-) -> Json<Vec<Order>> {
-    let mut orders = state
+) -> Json<Vec<ListedOrder>> {
+    let mut records = state
         .index
         .list_orders_for_user(&query.user_address)
         .await;
 
-    for order in &mut orders {
-        if order.question.is_empty() || order.market_slug.is_empty() {
-            if let Some(market) = state.index.get_market(order.market_id).await {
-                if order.question.is_empty() {
-                    order.question = market.question;
+    for record in &mut records {
+        if record.order.question.is_empty() || record.order.market_slug.is_empty() {
+            if let Some(market) = state.index.get_market(record.order.market_id).await {
+                if record.order.question.is_empty() {
+                    record.order.question = market.question;
                 }
-                if order.market_slug.is_empty() {
-                    order.market_slug = market.slug;
+                if record.order.market_slug.is_empty() {
+                    record.order.market_slug = market.slug;
                 }
             }
         }
     }
 
-    Json(orders)
+    Json(
+        records
+            .into_iter()
+            .map(|record| ListedOrder {
+                order: record.order,
+                chain_order_id: record.chain_order_id,
+                spot_market: record.spot_market,
+                user_address: record.user_address,
+                size_raw: record.size_raw,
+                filled_raw: record.filled_raw,
+            })
+            .collect(),
+    )
 }
 
 async fn query_order(
@@ -161,7 +173,7 @@ async fn query_order(
     let record = if let Some(chain_order_id) = query.chain_order_id.as_deref() {
         state
             .index
-            .query_order_by_chain_id(
+            .query_order(
                 &spot_market,
                 chain_order_id,
                 query.user_address.as_deref(),

@@ -417,14 +417,27 @@ impl IndexStore {
         crate::slug::allocate_unique_slug(&existing_slugs, question)
     }
 
-    pub async fn list_orders_for_user(&self, user_address: &str) -> Vec<Order> {
+    pub async fn list_orders_for_user(&self, user_address: &str) -> Vec<OrderQueryRecord> {
         let inner = self.inner.read().await;
-        inner
-            .orders
-            .values()
-            .filter(|stored| stored.user_address.eq_ignore_ascii_case(user_address))
-            .map(|stored| stored.order.clone())
-            .collect()
+        let mut out = Vec::new();
+        for stored in inner.orders.values() {
+            if !stored.user_address.eq_ignore_ascii_case(user_address) {
+                continue;
+            }
+            let Some(market) = inner.markets.get(&stored.order.market_id) else {
+                continue;
+            };
+            let spot_market = if stored.order.outcome == "yes" {
+                market.yes_spot_market.clone()
+            } else {
+                market.no_spot_market.clone()
+            };
+            out.push(Self::order_query_record(
+                stored,
+                normalize_spot_market_key(&spot_market),
+            ));
+        }
+        out
     }
 
 
@@ -628,7 +641,7 @@ impl IndexStore {
         inner.orders.insert(order.id, stored);
     }
 
-    pub async fn query_order_by_chain_id(
+    pub async fn query_order(
         &self,
         spot_market: &str,
         chain_order_id: &str,

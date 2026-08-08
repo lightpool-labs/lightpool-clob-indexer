@@ -10,7 +10,7 @@ mod vaults;
 
 pub use accounts::{BalanceEntry, BalanceTokenSpec, BalancesRequest};
 pub use markets::MarketsPageResponse;
-pub use orders::{CancelContextResponse, OrderQueryResponse};
+pub use orders::{CancelContextResponse, ListedOrder, OrderQueryResponse};
 pub use spot::{BookResponse, MarketInfoResponse};
 pub use tx::{SubmitTxRequest, SubmitTxResponse};
 pub use vaults::VaultsPageResponse;

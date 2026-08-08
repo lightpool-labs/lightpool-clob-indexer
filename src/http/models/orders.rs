@@ -21,3 +21,15 @@ pub struct OrderQueryResponse {
     pub size_raw: u64,
     pub filled_raw: u64,
 }
+
+/// Flat order record returned by `GET /api/orders`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListedOrder {
+    #[serde(flatten)]
+    pub order: Order,
+    pub chain_order_id: String,
+    pub spot_market: String,
+    pub user_address: String,
+    pub size_raw: u64,
+    pub filled_raw: u64,
+}

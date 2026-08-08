@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/:spot_market/book", get(get_book))
         .route("/:spot_market/info", get(get_market_info))
+        .route("/:spot_market/bars", get(get_bars))
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +29,14 @@ pub struct SpotBookQuery {
 #[derive(Debug, Deserialize)]
 pub struct SpotQuery {
     pub account: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BarsQuery {
+    pub interval: Option<String>,
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+    pub limit: Option<usize>,
 }
 
 async fn parse_account(account: &str) -> AppResult<Address> {
@@ -85,4 +94,43 @@ async fn get_market_info(
         taker_fee_bps: info.taker_fee_bps,
         allow_market_orders: info.allow_market_orders,
     }))
+}
+
+async fn get_bars(
+    State(state): State<AppState>,
+    Path(spot_market): Path<String>,
+    Query(query): Query<BarsQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let interval = query
+        .interval
+        .as_deref()
+        .unwrap_or(crate::bars::INTERVAL_1M);
+    match interval {
+        "1m" | "5m" | "15m" | "1h" | "4h" | "1d" => {}
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported interval `{other}`; use 1m|5m|15m|1h|4h|1d"
+            )));
+        }
+    }
+    let limit = query.limit.unwrap_or(500).clamp(1, 5000);
+    let bars = state
+        .bar_store
+        .load_history(&spot_market, interval, query.from, query.to, limit)
+        .await;
+    let forming = if interval == crate::bars::INTERVAL_1M {
+        state
+            .bar_store
+            .forming(&spot_market)
+            .await
+            .map(|b| b.to_ws_message("bar"))
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "spot_market": crate::spot_market::normalize_spot_market_key(&spot_market),
+        "interval": interval,
+        "bars": bars.iter().map(|b| b.to_ws_message("bar_closed")).collect::<Vec<_>>(),
+        "forming": forming,
+    })))
 }

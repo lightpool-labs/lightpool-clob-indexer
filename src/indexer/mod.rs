@@ -20,6 +20,7 @@ pub use store::{IndexStore, SharedIndexStore, SharedIndexedBlockHead, new_head};
 
 pub use book_store::SharedBookStore;
 
+use crate::bars::SharedBarStore;
 use crate::book_hydrate::{hydrate_all_spot_markets, SharedChainClient};
 use crate::error::{AppError, AppResult};
 use crate::peer::{
@@ -55,6 +56,7 @@ pub fn spawn(
     persist: Option<SharedPersist>,
     apply_gate: Option<IndexApplyGate>,
     mut peer_catchup: Option<PeerCatchupConfig>,
+    bar_store: SharedBarStore,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut first = true;
@@ -77,6 +79,7 @@ pub fn spawn(
                 persist.clone(),
                 apply_gate.clone(),
                 catchup,
+                bar_store.clone(),
             )
             .await
             {
@@ -176,7 +179,7 @@ pub fn spawn_checkpoint_worker(
                 &vault_portfolio,
             ) {
                 Ok(()) => {
-                    tracing::info!(
+                    tracing::debug!(
                         block_num,
                         digest = %digest,
                         "periodic sqlite checkpoint completed"
@@ -230,6 +233,7 @@ pub async fn recover_from_persist(
             book_store,
             user_hub,
             submit_wait,
+            None,
             block,
         )
         .await;
@@ -259,6 +263,7 @@ async fn run_once(
     persist: Option<SharedPersist>,
     apply_gate: Option<IndexApplyGate>,
     peer_catchup: Option<PeerCatchupConfig>,
+    bar_store: SharedBarStore,
 ) -> AppResult<()> {
     {
         let _apply = match &apply_gate {
@@ -302,6 +307,7 @@ async fn run_once(
                 &submit_wait,
                 &persist,
                 apply_gate.as_ref(),
+                &bar_store,
             )
             .await?;
         }
@@ -321,6 +327,7 @@ async fn run_once(
                     &submit_wait,
                     persist.as_ref(),
                     apply_gate.as_ref(),
+                    Some(&bar_store),
                 )
                 .await;
             }
@@ -346,6 +353,7 @@ async fn run_peer_catchup(
     submit_wait: &SharedSubmitWaitRegistry,
     persist: &SharedPersist,
     apply_gate: Option<&IndexApplyGate>,
+    bar_store: &SharedBarStore,
 ) -> AppResult<()> {
     let local_tip = head.read().await.block_num;
     let client = PeerClient::new();
@@ -477,6 +485,7 @@ async fn run_peer_catchup(
                 book_store,
                 user_hub,
                 submit_wait,
+                None,
                 block,
             )
             .await;
@@ -505,6 +514,7 @@ async fn run_peer_catchup(
                 book_store,
                 user_hub,
                 submit_wait,
+                Some(bar_store),
                 block,
             )
             .await;
@@ -546,6 +556,7 @@ async fn apply_live_block(
     submit_wait: &SharedSubmitWaitRegistry,
     persist: Option<&SharedPersist>,
     apply_gate: Option<&IndexApplyGate>,
+    bar_store: Option<&SharedBarStore>,
 ) {
     let block_num = block.block_num;
     let digest = hex::encode(block.digest.as_bytes());
@@ -584,6 +595,7 @@ async fn apply_live_block(
             book_store,
             user_hub,
             submit_wait,
+            bar_store,
             block,
         )
         .await;

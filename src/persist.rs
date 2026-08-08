@@ -11,6 +11,19 @@ use crate::error::{AppError, AppResult};
 use crate::indexer::{SharedBookStore, SharedIndexStore};
 use crate::spot_market::normalize_spot_market_key;
 
+#[derive(Debug, Clone)]
+pub struct ClosedBarRow {
+    pub spot_market: String,
+    pub interval: String,
+    pub start_ts: u64,
+    pub open_raw: u64,
+    pub high_raw: u64,
+    pub low_raw: u64,
+    pub close_raw: u64,
+    pub volume_raw: u64,
+    pub trade_count: u64,
+}
+
 #[derive(Clone)]
 pub struct SharedPersist {
     inner: Arc<Mutex<PersistStore>>,
@@ -147,6 +160,23 @@ impl SharedPersist {
 
     pub fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
         self.with(|store| store.delete_blocks_after(after_block_num))
+    }
+
+    pub fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
+        self.with(|store| store.save_closed_bar(bar))
+    }
+
+    pub fn load_closed_bars(
+        &self,
+        spot_market: &str,
+        interval: &str,
+        from_ts: Option<u64>,
+        to_ts: Option<u64>,
+        limit: usize,
+    ) -> AppResult<Vec<ClosedBarRow>> {
+        self.with(|store| {
+            store.load_closed_bars(spot_market, interval, from_ts, to_ts, limit)
+        })
     }
 
     pub fn checkpoint_exported(
@@ -377,6 +407,21 @@ impl PersistStore {
                     amount_raw INTEGER NOT NULL,
                     PRIMARY KEY (vault_id, spot_market)
                 );
+
+                CREATE TABLE IF NOT EXISTS bars (
+                    spot_market TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    start_ts INTEGER NOT NULL,
+                    open_raw INTEGER NOT NULL,
+                    high_raw INTEGER NOT NULL,
+                    low_raw INTEGER NOT NULL,
+                    close_raw INTEGER NOT NULL,
+                    volume_raw INTEGER NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    PRIMARY KEY (spot_market, interval, start_ts)
+                );
+                CREATE INDEX IF NOT EXISTS idx_bars_spot_interval_ts
+                    ON bars(spot_market, interval, start_ts);
                 ",
             )
             .map_err(|e| AppError::Internal(format!("sqlite migrate: {e}")))?;
@@ -829,6 +874,76 @@ impl PersistStore {
                 spot_market,
                 amount_raw: amount_raw as u64,
             });
+        }
+        Ok(out)
+    }
+}
+
+impl PersistStore {
+    fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO bars
+                 (spot_market, interval, start_ts, open_raw, high_raw, low_raw, close_raw, volume_raw, trade_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    normalize_spot_market_key(&bar.spot_market),
+                    bar.interval,
+                    bar.start_ts as i64,
+                    bar.open_raw as i64,
+                    bar.high_raw as i64,
+                    bar.low_raw as i64,
+                    bar.close_raw as i64,
+                    bar.volume_raw as i64,
+                    bar.trade_count as i64,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite save bar: {e}")))?;
+        Ok(())
+    }
+
+    fn load_closed_bars(
+        &self,
+        spot_market: &str,
+        interval: &str,
+        from_ts: Option<u64>,
+        to_ts: Option<u64>,
+        limit: usize,
+    ) -> AppResult<Vec<ClosedBarRow>> {
+        let spot = normalize_spot_market_key(spot_market);
+        let from = from_ts.unwrap_or(0) as i64;
+        let to = to_ts.unwrap_or(i64::MAX as u64) as i64;
+        let limit = limit.max(1) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT spot_market, interval, start_ts, open_raw, high_raw, low_raw,
+                        close_raw, volume_raw, trade_count
+                 FROM bars
+                 WHERE spot_market = ?1 AND interval = ?2
+                   AND start_ts >= ?3 AND start_ts <= ?4
+                 ORDER BY start_ts ASC
+                 LIMIT ?5",
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite prepare bars: {e}")))?;
+        let rows = stmt
+            .query_map(params![spot, interval, from, to, limit], |row| {
+                Ok(ClosedBarRow {
+                    spot_market: row.get(0)?,
+                    interval: row.get(1)?,
+                    start_ts: row.get::<_, i64>(2)? as u64,
+                    open_raw: row.get::<_, i64>(3)? as u64,
+                    high_raw: row.get::<_, i64>(4)? as u64,
+                    low_raw: row.get::<_, i64>(5)? as u64,
+                    close_raw: row.get::<_, i64>(6)? as u64,
+                    volume_raw: row.get::<_, i64>(7)? as u64,
+                    trade_count: row.get::<_, i64>(8)? as u64,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("sqlite query bars: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| AppError::Internal(format!("sqlite bar row: {e}")))?);
         }
         Ok(out)
     }
