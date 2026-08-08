@@ -73,7 +73,7 @@ impl SubmitQueue {
                 }
             }
 
-            tracing::error!("submit queue dispatcher stopped");
+            tracing::info!("submit queue dispatcher stopped");
         });
 
         tracing::info!(

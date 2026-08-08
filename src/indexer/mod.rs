@@ -13,6 +13,7 @@ use lightpool_sdk::{Message, ReceiptBlock, Subscription, WebSocketClient};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 pub use book_store::BookStore;
 pub use processor::{apply_order_created_to_book, index_order_created, publish_user_order_created};
@@ -57,32 +58,55 @@ pub fn spawn(
     apply_gate: Option<IndexApplyGate>,
     mut peer_catchup: Option<PeerCatchupConfig>,
     bar_store: SharedBarStore,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut first = true;
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+
             let catchup = if first {
                 first = false;
                 peer_catchup.take()
             } else {
                 None
             };
-            match run_once(
-                &ws_url,
-                &chain,
-                &query_account,
-                head.clone(),
-                index.clone(),
-                book_store.clone(),
-                user_hub.clone(),
-                submit_wait.clone(),
-                persist.clone(),
-                apply_gate.clone(),
-                catchup,
-                bar_store.clone(),
-            )
-            .await
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::info!("indexer cancelled");
+                    break;
+                }
+                result = run_once(
+                    &ws_url,
+                    &chain,
+                    &query_account,
+                    head.clone(),
+                    index.clone(),
+                    book_store.clone(),
+                    user_hub.clone(),
+                    submit_wait.clone(),
+                    persist.clone(),
+                    apply_gate.clone(),
+                    catchup,
+                    bar_store.clone(),
+                    cancel.clone(),
+                ) => result,
+            };
+
             {
+                let mut state = head.write().await;
+                state.connected = false;
+                state.catching_up = false;
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            match result {
                 Ok(()) => {
                     tracing::warn!("indexer stream ended, reconnecting in 5s");
                 }
@@ -91,13 +115,11 @@ pub fn spawn(
                 }
             }
 
-            {
-                let mut state = head.write().await;
-                state.connected = false;
-                state.catching_up = false;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
             }
-
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     })
 }
@@ -109,6 +131,7 @@ pub fn spawn_checkpoint_worker(
     index: SharedIndexStore,
     book_store: SharedBookStore,
     apply_gate: IndexApplyGate,
+    cancel: CancellationToken,
 ) -> JoinHandle<()> {
     let period = Duration::from_millis(interval_ms.max(1));
     tokio::spawn(async move {
@@ -118,67 +141,27 @@ pub fn spawn_checkpoint_worker(
         let mut last_digest = String::new();
 
         loop {
-            ticker.tick().await;
-
-            let snapshot = {
-                let _apply = apply_gate.lock().await;
-                let (block_num, digest, catching_up) = {
-                    let state = head.read().await;
-                    (state.block_num, state.digest.clone(), state.catching_up)
-                };
-
-                if catching_up || digest.is_empty() {
-                    None
-                } else if block_num == last_block_num && digest == last_digest {
-                    None
-                } else {
-                    let markets = index.export_markets_for_persist().await;
-                    let orders = index.export_orders_for_persist().await;
-                    let last_trades = index.export_last_trades_for_persist().await;
-                    let vaults = index.export_vaults_for_persist().await;
-                    let vault_portfolio = index.export_vault_portfolio_for_persist().await;
-                    let (levels, metas) = book_store.export_for_persist().await;
-                    Some((
-                        block_num,
-                        digest,
-                        markets,
-                        orders,
-                        last_trades,
-                        levels,
-                        metas,
-                        vaults,
-                        vault_portfolio,
-                    ))
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::info!("checkpoint worker cancelled");
+                    break;
                 }
-            };
+                _ = ticker.tick() => {}
+            }
 
-            let Some((
-                block_num,
-                digest,
-                markets,
-                orders,
-                last_trades,
-                levels,
-                metas,
-                vaults,
-                vault_portfolio,
-            )) = snapshot
-            else {
-                continue;
-            };
-
-            match persist.checkpoint_exported(
-                block_num,
-                &digest,
-                &markets,
-                &orders,
-                &last_trades,
-                &levels,
-                &metas,
-                &vaults,
-                &vault_portfolio,
-            ) {
-                Ok(()) => {
+            match checkpoint_once(
+                &persist,
+                &head,
+                &index,
+                &book_store,
+                &apply_gate,
+                Some((last_block_num, last_digest.as_str())),
+            )
+            .await
+            {
+                Ok(CheckpointOutcome::Skipped) => {}
+                Ok(CheckpointOutcome::Written { block_num, digest }) => {
                     tracing::debug!(
                         block_num,
                         digest = %digest,
@@ -188,15 +171,68 @@ pub fn spawn_checkpoint_worker(
                     last_digest = digest;
                 }
                 Err(error) => {
-                    tracing::error!(
-                        block_num,
-                        error = %error,
-                        "periodic sqlite checkpoint failed"
-                    );
+                    tracing::error!(error = %error, "periodic sqlite checkpoint failed");
                 }
             }
         }
     })
+}
+
+#[derive(Debug)]
+pub enum CheckpointOutcome {
+    Skipped,
+    Written { block_num: u64, digest: String },
+}
+
+pub async fn checkpoint_once(
+    persist: &SharedPersist,
+    head: &SharedIndexedBlockHead,
+    index: &SharedIndexStore,
+    book_store: &SharedBookStore,
+    apply_gate: &IndexApplyGate,
+    skip_if: Option<(u64, &str)>,
+) -> AppResult<CheckpointOutcome> {
+    let _apply = apply_gate.lock().await;
+    let (block_num, digest, catching_up) = {
+        let state = head.read().await;
+        (state.block_num, state.digest.clone(), state.catching_up)
+    };
+
+    if digest.is_empty() {
+        return Ok(CheckpointOutcome::Skipped);
+    }
+
+    if let Some((last_block_num, last_digest)) = skip_if {
+        if catching_up || (block_num == last_block_num && digest == last_digest) {
+            return Ok(CheckpointOutcome::Skipped);
+        }
+    } else if catching_up {
+        tracing::warn!(
+            block_num,
+            "final checkpoint while catching_up; persisting current head"
+        );
+    }
+
+    let markets = index.export_markets_for_persist().await;
+    let orders = index.export_orders_for_persist().await;
+    let last_trades = index.export_last_trades_for_persist().await;
+    let vaults = index.export_vaults_for_persist().await;
+    let vault_portfolio = index.export_vault_portfolio_for_persist().await;
+    let (levels, metas) = book_store.export_for_persist().await;
+
+    persist.checkpoint_exported(
+        block_num,
+        &digest,
+        &markets,
+        &orders,
+        &last_trades,
+        &levels,
+        &metas,
+        &vaults,
+        &vault_portfolio,
+    )?;
+
+    Ok(CheckpointOutcome::Written { block_num, digest })
 }
 
 pub async fn recover_from_persist(
@@ -264,7 +300,12 @@ async fn run_once(
     apply_gate: Option<IndexApplyGate>,
     peer_catchup: Option<PeerCatchupConfig>,
     bar_store: SharedBarStore,
+    cancel: CancellationToken,
 ) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+
     {
         let _apply = match &apply_gate {
             Some(gate) => Some(gate.lock().await),
@@ -274,6 +315,10 @@ async fn run_once(
         {
             tracing::warn!(error = %error, "startup spot market hydration failed");
         }
+    }
+
+    if cancel.is_cancelled() {
+        return Ok(());
     }
 
     let mut client = WebSocketClient::new(Some(ws_url.to_string()))
@@ -308,33 +353,47 @@ async fn run_once(
                 &persist,
                 apply_gate.as_ref(),
                 &bar_store,
+                &cancel,
             )
             .await?;
         }
     }
 
-    while let Some(message) = receiver.recv().await {
-        match message {
-            Message::NewBlock(block) => {
-                apply_live_block(
-                    block,
-                    chain,
-                    query_account,
-                    &head,
-                    &index,
-                    &book_store,
-                    &user_hub,
-                    &submit_wait,
-                    persist.as_ref(),
-                    apply_gate.as_ref(),
-                    Some(&bar_store),
-                )
-                .await;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Ok(());
             }
-            Message::Error(err) => {
-                return Err(AppError::Internal(format!("ws error: {err}")));
+            message = receiver.recv() => {
+                match message {
+                    Some(Message::NewBlock(block)) => {
+                        apply_live_block(
+                            block,
+                            chain,
+                            query_account,
+                            &head,
+                            &index,
+                            &book_store,
+                            &user_hub,
+                            &submit_wait,
+                            persist.as_ref(),
+                            apply_gate.as_ref(),
+                            Some(&bar_store),
+                        )
+                        .await;
+                    }
+                    Some(Message::Error(err)) => {
+                        return Err(AppError::Internal(format!("ws error: {err}")));
+                    }
+                    Some(Message::ReceiptBlock(_)) => {}
+                    None => break,
+                }
             }
-            Message::ReceiptBlock(_) => {}
         }
     }
 
@@ -354,6 +413,7 @@ async fn run_peer_catchup(
     persist: &SharedPersist,
     apply_gate: Option<&IndexApplyGate>,
     bar_store: &SharedBarStore,
+    cancel: &CancellationToken,
 ) -> AppResult<()> {
     let local_tip = head.read().await.block_num;
     let client = PeerClient::new();
@@ -407,6 +467,11 @@ async fn run_peer_catchup(
     let (snapshot, peer_blocks) = loop {
         tokio::select! {
             biased;
+            _ = cancel.cancelled() => {
+                let mut state = head.write().await;
+                state.catching_up = false;
+                return Ok(());
+            }
             msg = receiver.recv() => {
                 match msg {
                     Some(Message::NewBlock(block)) => live_buffer.push(block),

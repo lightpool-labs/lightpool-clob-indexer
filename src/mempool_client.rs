@@ -65,7 +65,7 @@ async fn run_mempool_sender(addr: SocketAddr, mut receiver: mpsc::Receiver<Submi
         }
     }
 
-    tracing::warn!(%addr, "mempool sender stopped");
+    tracing::info!(%addr, "mempool sender stopped");
 }
 
 async fn send_on_connection(
