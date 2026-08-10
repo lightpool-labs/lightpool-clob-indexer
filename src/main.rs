@@ -38,7 +38,7 @@ async fn main() {
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
-            |_| "lightpool_clob_index=info,tower_http=warn".into(),
+            |_| "lightpool_clob_indexer=info,tower_http=warn".into(),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -163,7 +163,7 @@ async fn main() {
         .parse()
         .expect("invalid listen address");
 
-    tracing::info!("lightpool-clob-index listening on http://{addr}");
+    tracing::info!("lightpool-clob-indexer listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

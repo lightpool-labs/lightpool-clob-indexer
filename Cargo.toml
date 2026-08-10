@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "lightpool-clob-index"
+name = "lightpool-clob-indexer"
 version = "0.2.0"
 edition = "2021"
 publish = false
@@ -31,7 +31,7 @@ base64 = "0.22"
 lightpool-sdk = { path = "../lightpool/crates/lightpool-sdk" }
 
 [[bin]]
-name = "lightpool-clob-index"
+name = "lightpool-clob-indexer"
 path = "src/main.rs"
 
 [[bin]]

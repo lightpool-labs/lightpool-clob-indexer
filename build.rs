@@ -51,7 +51,7 @@ fn main() {
             .into_owned()
     });
 
-    let log_path = format!("{target_dir}/lightpool-clob-index-package.log");
+    let log_path = format!("{target_dir}/lightpool-clob-indexer-package.log");
     let wrapper = format!("nohup bash {script:?} >>{log_path:?} 2>&1 &");
 
     Command::new("bash")

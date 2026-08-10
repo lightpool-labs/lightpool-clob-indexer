@@ -1,4 +1,4 @@
-# lightpool-clob-index
+# lightpool-clob-indexer
 
 On-chain orderbook indexer for [LightPool](https://github.com/lightpool-labs/lightpool-node) — a self-deployable L1 with spot matching and settlement on chain (targeting 200k TPS).
 

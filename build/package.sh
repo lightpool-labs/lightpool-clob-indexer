@@ -7,8 +7,8 @@ TARGET_DIR="${CARGO_TARGET_DIR:?}"
 OS="${CARGO_CFG_TARGET_OS:?}"
 ARCH="${CARGO_CFG_TARGET_ARCH:?}"
 
-BINARY="${TARGET_DIR}/release/lightpool-clob-index"
-LOCK_DIR="${TARGET_DIR}/.lightpool-clob-index-package.lock.d"
+BINARY="${TARGET_DIR}/release/lightpool-clob-indexer"
+LOCK_DIR="${TARGET_DIR}/.lightpool-clob-indexer-package.lock.d"
 
 case "${OS}" in
   linux) PLATFORM_OS="linux" ;;
@@ -29,7 +29,7 @@ case "${ARCH}" in
 esac
 
 PLATFORM="${PLATFORM_OS}-${PLATFORM_ARCH}"
-PACKAGE_NAME="lightpool-clob-index-v${VERSION}-${PLATFORM}-${GIT_COMMIT}"
+PACKAGE_NAME="lightpool-clob-indexer-v${VERSION}-${PLATFORM}-${GIT_COMMIT}"
 STAGING_ROOT="${TARGET_DIR}/package-staging"
 STAGING="${STAGING_ROOT}/${PACKAGE_NAME}"
 ARCHIVE="${TARGET_DIR}/${PACKAGE_NAME}.tar.gz"
@@ -74,8 +74,8 @@ wait_for_binary() {
 create_archive() {
   rm -rf "${STAGING}"
   mkdir -p "${STAGING}/bin"
-  cp "${BINARY}" "${STAGING}/bin/lightpool-clob-index"
-  chmod +x "${STAGING}/bin/lightpool-clob-index"
+  cp "${BINARY}" "${STAGING}/bin/lightpool-clob-indexer"
+  chmod +x "${STAGING}/bin/lightpool-clob-indexer"
 
   rm -f "${ARCHIVE}"
   tar -czf "${ARCHIVE}" -C "${STAGING_ROOT}" "${PACKAGE_NAME}"

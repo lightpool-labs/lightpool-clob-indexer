@@ -1755,7 +1755,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightpool-clob-index"
+name = "lightpool-clob-indexer"
 version = "0.2.0"
 dependencies = [
  "axum",
