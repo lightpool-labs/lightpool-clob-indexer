@@ -41,7 +41,7 @@ async fn submit_transaction(
     if !response.receipt.is_success() {
         tracing::warn!(
             digest = %response.digest,
-            block_num = response.receipt.block_num,
+            block_num = response.block_num,
             status = ?response.receipt.status,
             "submit HTTP response failed transaction"
         );
@@ -55,13 +55,14 @@ async fn submit_transaction(
         digest = %response.digest,
         sender = %sender,
         actions,
-        block_num = response.receipt.block_num,
+        block_num = response.block_num,
         event_count = response.receipt.event_count(),
         "submit HTTP response sent to client with receipt"
     );
 
     Ok(Json(SubmitTxResponse {
         digest: response.digest,
+        block_num: response.block_num,
         receipt: response.receipt,
     }))
 }

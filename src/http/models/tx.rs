@@ -13,5 +13,6 @@ pub struct SubmitTxRequest {
 #[derive(Debug, serde::Serialize)]
 pub struct SubmitTxResponse {
     pub digest: String,
+    pub block_num: u64,
     pub receipt: TransactionReceipt,
 }

@@ -1783,6 +1783,7 @@ dependencies = [
 [[package]]
 name = "lightpool-crypto"
 version = "0.1.0"
+source = "git+https://github.com/xiaoyu1998/lightpool-crypto.git#b1e7b491813c531c839bef78c02f12f6675b8493"
 dependencies = [
  "base64 0.13.1",
  "bincode",

@@ -7,9 +7,15 @@ use dashmap::DashMap;
 use lightpool_sdk::lightpool_types::TransactionReceipt;
 use tokio::sync::oneshot;
 
+#[derive(Clone, Debug)]
+pub struct SubmitWaitResult {
+    pub block_num: u64,
+    pub receipt: TransactionReceipt,
+}
+
 #[derive(Default)]
 pub struct SubmitWaitRegistry {
-    pending: DashMap<String, oneshot::Sender<TransactionReceipt>>,
+    pending: DashMap<String, oneshot::Sender<SubmitWaitResult>>,
 }
 
 pub type SharedSubmitWaitRegistry = Arc<SubmitWaitRegistry>;
@@ -25,7 +31,7 @@ impl SubmitWaitRegistry {
         Arc::new(Self::new())
     }
 
-    pub fn register(&self, digest_hex: &str) -> oneshot::Receiver<TransactionReceipt> {
+    pub fn register(&self, digest_hex: &str) -> oneshot::Receiver<SubmitWaitResult> {
         let (sender, receiver) = oneshot::channel();
         self.pending.insert(digest_hex.to_string(), sender);
         receiver
@@ -35,10 +41,17 @@ impl SubmitWaitRegistry {
         self.pending.remove(digest_hex);
     }
 
-    pub fn complete(&self, digest_hex: &str, receipt: TransactionReceipt) -> bool {
+    pub fn complete(
+        &self,
+        digest_hex: &str,
+        block_num: u64,
+        receipt: TransactionReceipt,
+    ) -> bool {
         let Some((_, sender)) = self.pending.remove(digest_hex) else {
             return false;
         };
-        sender.send(receipt).is_ok()
+        sender
+            .send(SubmitWaitResult { block_num, receipt })
+            .is_ok()
     }
 }

@@ -259,9 +259,7 @@ pub async fn recover_from_persist(
 
     let mut head = snapshot;
     for (block_num, digest, payload) in blocks {
-        let block: ReceiptBlock = serde_json::from_slice(&payload).map_err(|e| {
-            AppError::Internal(format!("decode persisted block {block_num}: {e}"))
-        })?;
+        let block = decode_block_payload(block_num, &payload)?;
         process_block(
             chain,
             query_account,

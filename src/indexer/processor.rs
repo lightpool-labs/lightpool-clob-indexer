@@ -2,8 +2,8 @@
 // Author: xiaoyu1998
 
 use lightpool_sdk::event_contract_events::{
-    EventContractBurnedEvent, EventContractClosedEvent, EventContractCreatedEvent,
-    EventContractMintedEvent, EventContractRedeemedEvent, EventContractResolvedEvent,
+    EventContractBurnedEvent, EventContractCreatedEvent, EventContractMintedEvent,
+    EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
     OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent, OrderUpdatedEvent,
@@ -71,9 +71,8 @@ pub async fn process_block(
 ) {
     for tx_result in &block.transaction_outputs {
         // Match submit_queue register key: SignedTransaction digest (tx + signature).
-        // receipt.transaction_digest is the unsigned Transaction digest from execution.
-        let digest = hex::encode(tx_result.transaction.digest().as_bytes());
-        if !submit_wait.complete(&digest, tx_result.receipt.clone()) {
+        let digest = hex::encode(tx_result.signed_digest.as_bytes());
+        if !submit_wait.complete(&digest, block.block_num, tx_result.receipt.clone()) {
             tracing::debug!(
                 digest,
                 "no pending submit waiter for transaction digest"
@@ -130,20 +129,6 @@ pub async fn process_block(
                                 .update_market_state(
                                     &resolved.market_address.to_string(),
                                     "Resolved",
-                                )
-                                .await;
-                        }
-                    }
-                }
-                "event_contract_closed" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(closed) =
-                            bincode::deserialize::<EventContractClosedEvent>(data)
-                        {
-                            store
-                                .update_market_state(
-                                    &closed.market_address.to_string(),
-                                    "Closed",
                                 )
                                 .await;
                         }
@@ -521,13 +506,11 @@ pub async fn process_block(
 fn log_tx_result(tx_result: &TransactionResult) {
     let digest = hex::encode(tx_result.transaction_digest().as_bytes());
     let sender = tx_result.sender().to_string();
-    let block_num = tx_result.receipt.block_num;
 
     match &tx_result.receipt.status {
         ExecutionStatus::Failure(msg) => {
             tracing::info!(
                 tx_digest = %digest,
-                block_num,
                 sender = %sender,
                 success = false,
                 error = msg.as_str(),
@@ -547,7 +530,6 @@ fn log_tx_result(tx_result: &TransactionResult) {
 
     tracing::info!(
         tx_digest = %digest,
-        block_num,
         sender = %sender,
         success = true,
         event_count = event_summaries.len(),
@@ -621,11 +603,6 @@ fn format_event_detail(event: &TransactionEvent) -> String {
                     "event_contract_resolved: market={} outcome={}",
                     e.market_address, e.outcome
                 );
-            }
-        }
-        "event_contract_closed" => {
-            if let Ok(e) = bincode::deserialize::<EventContractClosedEvent>(bytes) {
-                return format!("event_contract_closed: market={}", e.market_address);
             }
         }
         "event_contract_redeemed" => {

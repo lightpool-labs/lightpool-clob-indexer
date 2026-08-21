@@ -4,13 +4,13 @@
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use lightpool_sdk::lightpool_types::{SignedTransaction, TransactionReceipt};
+use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AppError, AppResult};
 use crate::mempool_client::MempoolClient;
-use crate::submit_wait::SharedSubmitWaitRegistry;
+use crate::submit_wait::{SharedSubmitWaitRegistry, SubmitWaitResult};
 
 struct SubmitJob {
     tx: SignedTransaction,
@@ -102,7 +102,7 @@ async fn submit_and_wait(
     submit_wait: &SharedSubmitWaitRegistry,
     digest_hex: &str,
     tx: SignedTransaction,
-    receipt_rx: oneshot::Receiver<TransactionReceipt>,
+    receipt_rx: oneshot::Receiver<SubmitWaitResult>,
     wait_timeout: Duration,
 ) -> AppResult<SubmitTransactionResponse> {
     let sender = tx.transaction().sender();
@@ -125,18 +125,19 @@ async fn submit_and_wait(
     );
 
     match tokio::time::timeout(wait_timeout, receipt_rx).await {
-        Ok(Ok(receipt)) => {
+        Ok(Ok(wait_result)) => {
             tracing::info!(
                 digest = digest_hex,
                 sender = %sender,
-                block_num = receipt.block_num,
-                success = receipt.is_success(),
-                event_count = receipt.event_count(),
+                block_num = wait_result.block_num,
+                success = wait_result.receipt.is_success(),
+                event_count = wait_result.receipt.event_count(),
                 "submit receipt received; ready for HTTP response"
             );
             Ok(SubmitTransactionResponse {
                 digest: digest_hex.to_string(),
-                receipt,
+                block_num: wait_result.block_num,
+                receipt: wait_result.receipt,
             })
         }
         Ok(Err(_)) => {
