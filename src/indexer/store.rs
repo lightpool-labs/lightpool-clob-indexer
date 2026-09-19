@@ -51,6 +51,10 @@ struct IndexStoreInner {
     markets: HashMap<Uuid, Market>,
     slug_to_market_id: HashMap<String, Uuid>,
     spot_to_market: HashMap<String, SpotMarketRef>,
+    /// Spot pair name (e.g. `AAPL/USDT`) → spot `ContractAddress` key.
+    spot_by_name: HashMap<String, String>,
+    /// Base symbol (e.g. `AAPL`) → spot `ContractAddress` key.
+    spot_by_symbol: HashMap<String, String>,
     last_trade_price_by_spot: HashMap<String, u64>,
     orders: HashMap<Uuid, StoredOrder>,
     chain_order_index: HashMap<String, Uuid>,
@@ -527,6 +531,43 @@ impl IndexStore {
     pub async fn list_spot_markets(&self) -> Vec<String> {
         let inner = self.inner.read().await;
         inner.spot_to_market.keys().cloned().collect()
+    }
+
+    pub async fn register_named_spot_market(&self, name: &str, spot_market: &str) {
+        let spot = normalize_spot_market_key(spot_market);
+        let name_key = name.trim().to_ascii_uppercase();
+        if name_key.is_empty() || spot.is_empty() {
+            return;
+        }
+
+        let mut inner = self.inner.write().await;
+        inner.spot_by_name.insert(name_key.clone(), spot.clone());
+        if let Some((symbol, _)) = name_key.split_once('/') {
+            if !symbol.is_empty() {
+                inner.spot_by_symbol.insert(symbol.to_string(), spot);
+            }
+        } else {
+            inner.spot_by_symbol.insert(name_key, spot);
+        }
+    }
+
+    /// Resolve `AAPL`, `AAPL/USDT`, or a spot `ContractAddress` hex to a normalized spot key.
+    pub async fn resolve_spot_market_key(&self, id_or_symbol: &str) -> Option<String> {
+        let key = id_or_symbol.trim();
+        if key.is_empty() {
+            return None;
+        }
+        if key.starts_with("0x") || key.starts_with("0X") {
+            return Some(normalize_spot_market_key(key));
+        }
+
+        let upper = key.to_ascii_uppercase();
+        let inner = self.inner.read().await;
+        inner
+            .spot_by_symbol
+            .get(&upper)
+            .or_else(|| inner.spot_by_name.get(&upper))
+            .cloned()
     }
 
     pub async fn record_last_trade_price(&self, spot_market: &str, price: u64) {

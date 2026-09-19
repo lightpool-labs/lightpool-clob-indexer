@@ -6,8 +6,8 @@ use lightpool_sdk::event_contract_events::{
     EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
-    OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent, OrderUpdatedEvent,
-    parse_spot_event_data,
+    MarketCreatedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent,
+    OrderUpdatedEvent, parse_spot_event_data,
 };
 use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
@@ -202,6 +202,19 @@ pub async fn process_block(
                     if let EventData::Bytes(data) = &event.data {
                         if let Ok(closed) = bincode::deserialize::<VaultClosedEvent>(data) {
                             store.mark_vault_closed(&closed.vault.to_string()).await;
+                        }
+                    }
+                }
+                "market_created" => {
+                    if let EventData::Bytes(data) = &event.data {
+                        match bincode::deserialize::<MarketCreatedEvent>(data) {
+                            Ok(created) => {
+                                index_spot_market_created(store, book_store, chain, query_account, created)
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to decode market_created");
+                            }
                         }
                     }
                 }
@@ -834,6 +847,45 @@ fn warn_outcome_price_mismatch(outcome: &str, price_raw: u64, spot_market: &str,
             outcome,
             price = %price_display,
             "order price looks inconsistent with spot outcome (possible wrong spot or mapping bug)"
+        );
+    }
+}
+
+async fn index_spot_market_created(
+    store: &SharedIndexStore,
+    book_store: &SharedBookStore,
+    chain: &SharedChainClient,
+    query_account: &str,
+    created: MarketCreatedEvent,
+) {
+    let spot_market = created.market_address.to_string();
+    let name = created.name.to_string();
+
+    tracing::info!(
+        name = %name,
+        spot_market = %spot_market,
+        "indexed spot market"
+    );
+
+    store
+        .register_named_spot_market(&name, &spot_market)
+        .await;
+
+    if let Err(error) = ensure_chain_hydrated(
+        chain,
+        book_store,
+        store,
+        query_account,
+        &spot_market,
+        DEFAULT_BOOK_DEPTH,
+    )
+    .await
+    {
+        tracing::warn!(
+            name = %name,
+            spot_market = %spot_market,
+            error = %error,
+            "failed to hydrate spot book after market_created"
         );
     }
 }

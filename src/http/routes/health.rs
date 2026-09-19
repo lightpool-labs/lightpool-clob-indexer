@@ -11,10 +11,21 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/client_version", get(get_client_version))
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn get_client_version() -> Json<serde_json::Value> {
+    Json(json!({
+        "client_version": format!(
+            "{}/{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        ),
+    }))
 }
 
 async fn ready(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {

@@ -46,9 +46,11 @@ All routes are under `/api`.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/health` | Liveness |
-| `GET` | `/api/ready` | Readiness |
-| `GET` | `/api/spot/:market/book` | Spot orderbook |
+| `GET` | `/api/health/health` | Liveness |
+| `GET` | `/api/health/ready` | Readiness |
+| `GET` | `/api/health/client_version` | Indexer client version |
+| `GET` | `/api/spot/:market/book` | Spot orderbook by `ContractAddress` |
+| `GET` | `/api/markets/:symbol/book` | Spot orderbook by symbol (e.g. `AAPL`) or pair (`AAPL/USDT`) |
 | `GET` | `/api/spot/:market/info` | Spot market info |
 | `GET` | `/api/spot/:market/bars` | Bars / candles |
 | `GET` | `/api/orders` | List orders |
