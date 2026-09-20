@@ -260,16 +260,17 @@ pub async fn process_block(
                                         error = %error,
                                         "failed to hydrate book before order_created"
                                     );
-                                } else {
-                                    apply_order_created_to_book(
-                                        book_store,
-                                        store,
-                                        block_num,
-                                        &created,
-                                        &spot_market,
-                                    )
-                                    .await;
                                 }
+                                // Always apply the event delta. Hydrate is best-effort; if get_book
+                                // RPC is unavailable, skipping apply leaves an empty book forever.
+                                apply_order_created_to_book(
+                                    book_store,
+                                    store,
+                                    block_num,
+                                    &created,
+                                    &spot_market,
+                                )
+                                .await;
                                 index_order_created(store, created, &spot_market, None).await;
                                 publish_user_order_created(
                                     user_hub,
@@ -358,19 +359,18 @@ pub async fn process_block(
                                             error = %error,
                                             "failed to hydrate book before order_updated"
                                         );
-                                    } else {
-                                        book_store
-                                            .apply_updated(
-                                                &spot_market,
-                                                updated.side,
-                                                updated.price,
-                                                updated.old_amount,
-                                                updated.new_amount,
-                                                updated.remaining_amount,
-                                                block_num,
-                                            )
-                                            .await;
                                     }
+                                    book_store
+                                        .apply_updated(
+                                            &spot_market,
+                                            updated.side,
+                                            updated.price,
+                                            updated.old_amount,
+                                            updated.new_amount,
+                                            updated.remaining_amount,
+                                            block_num,
+                                        )
+                                        .await;
                                     store
                                         .update_order_amount(
                                             &spot_market,
@@ -448,18 +448,17 @@ pub async fn process_block(
                                     error = %error,
                                     "failed to hydrate book before order_filled"
                                 );
-                            } else {
-                                book_store
-                                    .apply_filled(
-                                        &spot_market,
-                                        filled.side,
-                                        filled.price,
-                                        filled.fill_amount,
-                                        block_num,
-                                        filled.price,
-                                    )
-                                    .await;
                             }
+                            book_store
+                                .apply_filled(
+                                    &spot_market,
+                                    filled.side,
+                                    filled.price,
+                                    filled.fill_amount,
+                                    block_num,
+                                    filled.price,
+                                )
+                                .await;
                             store
                                 .update_order_fill(
                                     &spot_market,
@@ -973,13 +972,16 @@ pub async fn index_order_created(
     spot_market: &str,
     status_override: Option<(String, u64)>,
 ) -> Option<Order> {
-    let Some((market_id, outcome)) = store.lookup_spot_market(spot_market).await else {
-        tracing::warn!(
-            spot_market,
-            order_id = %created.order_id,
-            "order_created for unknown spot market (book updated but order not indexed)"
-        );
-        return None;
+    let (market_id, outcome) = match store.lookup_spot_market(spot_market).await {
+        Some(mapped) => mapped,
+        None => {
+            tracing::info!(
+                spot_market,
+                order_id = %created.order_id,
+                "order_created for standalone spot market; registering for order index"
+            );
+            store.ensure_standalone_spot_market(spot_market).await
+        }
     };
 
     let price_raw = match &created.order_type {

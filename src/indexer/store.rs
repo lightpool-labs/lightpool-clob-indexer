@@ -542,13 +542,72 @@ impl IndexStore {
 
         let mut inner = self.inner.write().await;
         inner.spot_by_name.insert(name_key.clone(), spot.clone());
-        if let Some((symbol, _)) = name_key.split_once('/') {
+        let symbol = if let Some((symbol, _)) = name_key.split_once('/') {
             if !symbol.is_empty() {
-                inner.spot_by_symbol.insert(symbol.to_string(), spot);
+                inner.spot_by_symbol.insert(symbol.to_string(), spot.clone());
+                symbol.to_string()
+            } else {
+                inner.spot_by_symbol.insert(name_key.clone(), spot.clone());
+                name_key.clone()
             }
         } else {
-            inner.spot_by_symbol.insert(name_key, spot);
+            inner.spot_by_symbol.insert(name_key.clone(), spot.clone());
+            name_key.clone()
+        };
+
+        // Equity / standalone spots are not event-contract yes/no markets. Still map them so
+        // `GET /api/orders` and the user WS channel can index placements (book alone is not enough).
+        let market_id = market_uuid(&spot);
+        inner.spot_to_market.entry(spot.clone()).or_insert(SpotMarketRef {
+            market_id,
+            outcome: "spot".into(),
+        });
+        inner.markets.entry(market_id).or_insert_with(|| Market {
+            id: market_id,
+            slug: symbol.to_ascii_lowercase(),
+            question: name.trim().to_string(),
+            icon_url: None,
+            market_address: spot.clone(),
+            collateral_token: String::new(),
+            yes_token: String::new(),
+            no_token: String::new(),
+            yes_spot_market: spot.clone(),
+            no_spot_market: spot,
+            state: "Active".into(),
+            resolution_deadline: 0,
+        });
+        inner
+            .slug_to_market_id
+            .entry(symbol.to_ascii_lowercase())
+            .or_insert(market_id);
+    }
+
+    /// Ensure a standalone spot (tokenized equity) is resolvable for order indexing.
+    pub async fn ensure_standalone_spot_market(&self, spot_market: &str) -> (Uuid, String) {
+        let spot = normalize_spot_market_key(spot_market);
+        if let Some(existing) = self.lookup_spot_market(&spot).await {
+            return existing;
         }
+        let name = {
+            let inner = self.inner.read().await;
+            inner
+                .spot_by_name
+                .iter()
+                .find(|(_, value)| value == &&spot)
+                .map(|(name, _)| name.clone())
+                .or_else(|| {
+                    inner
+                        .spot_by_symbol
+                        .iter()
+                        .find(|(_, value)| value == &&spot)
+                        .map(|(symbol, _)| symbol.clone())
+                })
+                .unwrap_or_else(|| spot.clone())
+        };
+        self.register_named_spot_market(&name, &spot).await;
+        self.lookup_spot_market(&spot)
+            .await
+            .unwrap_or_else(|| (market_uuid(&spot), "spot".into()))
     }
 
     /// Resolve `AAPL`, `AAPL/USDT`, or a spot `ContractAddress` hex to a normalized spot key.

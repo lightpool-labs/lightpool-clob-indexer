@@ -56,7 +56,7 @@ async fn get_book(
 ) -> AppResult<Json<BookResponse>> {
     let depth = query.depth.unwrap_or(10).clamp(1, 50);
 
-    crate::book_hydrate::rehydrate_spot_from_chain(
+    if let Err(error) = crate::book_hydrate::rehydrate_spot_from_chain(
         &state.chain,
         &state.book_store,
         &state.index,
@@ -64,7 +64,14 @@ async fn get_book(
         &spot_market,
         depth,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(
+            spot_market = %spot_market,
+            error = %error,
+            "chain book hydrate failed; serving in-memory snapshot"
+        );
+    }
 
     let book = state
         .book_store
