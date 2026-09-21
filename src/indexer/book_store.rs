@@ -1,8 +1,9 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lightpool_sdk::lightpool_types::call::GetOrderBook;
 use lightpool_sdk::OrderSide;
@@ -12,8 +13,17 @@ use crate::chain::{format_price_pieces, format_token_amount};
 use crate::domain::{BookLevel, BookSnapshot};
 use crate::spot_market::normalize_spot_market_key;
 use crate::ws::models::{
-    BookLevelDelta, OrderBookDelta, OrderBookSnapshot, QuoteDelta, QuoteSnapshot,
+    BookLevelDelta, OrderBookDelta, OrderBookSnapshot, QuoteDelta, QuoteSnapshot, RecentTrade,
 };
+
+const RECENT_TRADE_LIMIT: usize = 50;
+
+#[derive(Clone, Copy)]
+struct FillKey {
+    block_num: u64,
+    price_raw: u64,
+    size_raw: u64,
+}
 
 #[derive(Debug, Default)]
 struct SpotBook {
@@ -29,6 +39,9 @@ struct BookStoreInner {
     chain_hydrated: HashSet<String>,
     publishers: HashMap<String, broadcast::Sender<OrderBookDelta>>,
     quote_publishers: HashMap<String, broadcast::Sender<QuoteDelta>>,
+    trades: HashMap<String, VecDeque<RecentTrade>>,
+    last_fill: HashMap<String, FillKey>,
+    trade_seq: u64,
 }
 
 pub struct BookStore {
@@ -311,7 +324,7 @@ impl BookStore {
         }
         let key = Self::key(spot_market);
         let mut inner = self.inner.write().await;
-        let delta = Self::apply_level_change(
+        let mut delta = Self::apply_level_change(
             &mut inner,
             &key,
             side,
@@ -321,7 +334,69 @@ impl BookStore {
             block_num,
             Some(last_trade_price),
         );
+        let fill_key = FillKey {
+            block_num,
+            price_raw,
+            size_raw: fill_amount_raw,
+        };
+        let duplicate = inner.last_fill.get(&key).is_some_and(|prev| {
+            prev.block_num == fill_key.block_num
+                && prev.price_raw == fill_key.price_raw
+                && prev.size_raw == fill_key.size_raw
+        });
+        inner.last_fill.insert(key.clone(), fill_key);
+        if !duplicate {
+            if let Some(trade) = Self::push_trade(&mut inner, &key, side, price_raw, fill_amount_raw, block_num)
+            {
+                if let Some(delta) = delta.as_mut() {
+                    delta.trade = Some(trade);
+                }
+            }
+        }
         Self::publish_delta(&inner, delta);
+    }
+
+    pub async fn recent_trades(&self, spot_market: &str) -> Vec<RecentTrade> {
+        let key = Self::key(spot_market);
+        let inner = self.inner.read().await;
+        inner
+            .trades
+            .get(&key)
+            .map(|trades| trades.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn push_trade(
+        inner: &mut BookStoreInner,
+        spot_market: &str,
+        side: OrderSide,
+        price_raw: u64,
+        size_raw: u64,
+        block_num: u64,
+    ) -> Option<RecentTrade> {
+        inner.trade_seq = inner.trade_seq.saturating_add(1);
+        let side = match side {
+            OrderSide::Buy => "buy",
+            OrderSide::Sell => "sell",
+        };
+        let time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let trade = RecentTrade {
+            id: inner.trade_seq,
+            side: side.into(),
+            price: format_price_pieces(price_raw),
+            size: format_token_amount(size_raw),
+            time_ms,
+            block_num,
+        };
+        let trades = inner.trades.entry(spot_market.to_string()).or_default();
+        trades.push_front(trade.clone());
+        while trades.len() > RECENT_TRADE_LIMIT {
+            trades.pop_back();
+        }
+        Some(trade)
     }
 
     fn apply_level_change(
@@ -384,6 +459,7 @@ impl BookStore {
             last_trade_price: book
                 .last_trade_price
                 .map(|price| format_price_pieces(price)),
+            trade: None,
         })
     }
 

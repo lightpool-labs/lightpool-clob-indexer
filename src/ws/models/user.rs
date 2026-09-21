@@ -14,6 +14,7 @@ pub struct UserOrderMessage {
     pub user_address: String,
     pub chain_order_id: String,
     pub block_num: u64,
+    pub spot_market: String,
     #[serde(flatten)]
     pub order: Order,
 }
@@ -34,6 +35,8 @@ pub struct UserTradeMessage {
     pub is_fully_filled: bool,
     pub spot_market: String,
     pub block_num: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

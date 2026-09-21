@@ -492,6 +492,8 @@ pub async fn process_block(
                                 filled.is_fully_filled,
                                 filled.side,
                                 block_num,
+                                filled.cloid.clone(),
+                                tx_result.sender().to_string(),
                             )
                             .await;
                         }
@@ -1021,6 +1023,7 @@ pub async fn index_order_created(
         price: format_price_pieces(price_raw),
         size: format_token_amount(created.amount),
         status,
+        cloid: created.cloid.clone(),
     };
 
     tracing::info!(
@@ -1061,6 +1064,7 @@ pub async fn publish_user_order_created(
             "placement",
             &user_address,
             chain_order_id,
+            spot_market,
             order,
             block_num,
         )
@@ -1084,6 +1088,7 @@ async fn publish_user_order_cancelled(
             "cancellation",
             &user_address,
             chain_order_id,
+            spot_market,
             order,
             block_num,
         )
@@ -1107,6 +1112,7 @@ async fn publish_user_order_updated(
             "update",
             &user_address,
             chain_order_id,
+            spot_market,
             order,
             block_num,
         )
@@ -1124,10 +1130,18 @@ async fn publish_user_order_filled(
     is_fully_filled: bool,
     side: lightpool_sdk::OrderSide,
     block_num: u64,
+    cloid: Option<String>,
+    tx_sender: String,
 ) {
-    let Some((order, user_address, _)) =
-        store.stored_order_by_chain_id(spot_market, chain_order_id).await
-    else {
+    let stored = store
+        .stored_order_by_chain_id(spot_market, chain_order_id)
+        .await;
+    let (order, user_address, stored_cloid) = if let Some((order, user_address, _)) = stored {
+        let stored_cloid = order.cloid.clone();
+        (Some(order), user_address, stored_cloid)
+    } else if cloid.is_some() {
+        (None, tx_sender, None)
+    } else {
         return;
     };
 
@@ -1135,14 +1149,17 @@ async fn publish_user_order_filled(
         lightpool_sdk::OrderSide::Buy => "buy",
         lightpool_sdk::OrderSide::Sell => "sell",
     };
+    let order_id = order.as_ref().map(|order| order.id).unwrap_or_else(Uuid::nil);
+    let market_slug = order.as_ref().map(|order| order.market_slug.as_str()).unwrap_or("");
+    let outcome = order.as_ref().map(|order| order.outcome.as_str()).unwrap_or("");
 
     user_hub
         .publish_trade(
             &user_address,
             chain_order_id,
-            order.id,
-            &order.market_slug,
-            &order.outcome,
+            order_id,
+            market_slug,
+            outcome,
             side_str,
             &format_price_pieces(price_raw),
             &format_token_amount(fill_amount_raw),
@@ -1150,11 +1167,15 @@ async fn publish_user_order_filled(
             is_fully_filled,
             spot_market,
             block_num,
+            cloid.or(stored_cloid),
         )
         .await;
 
+    let Some(order) = order else {
+        return;
+    };
     let event = "update";
     user_hub
-        .publish_order(event, &user_address, chain_order_id, order, block_num)
+        .publish_order(event, &user_address, chain_order_id, spot_market, order, block_num)
         .await;
 }

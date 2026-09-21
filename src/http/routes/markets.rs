@@ -8,9 +8,11 @@ use axum::{
 };
 use serde::Deserialize;
 
+use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
 use crate::domain::Market;
 use crate::error::{AppError, AppResult};
 use crate::http::models::{BalanceTokenSpec, BookResponse, MarketsPageResponse};
+use crate::ws::models::RecentTrade;
 use crate::http::process::{build_market_query, QueryMarketsParams};
 use crate::state::AppState;
 
@@ -20,6 +22,7 @@ pub fn router() -> Router<AppState> {
         .route("/slug/:slug", get(get_market_by_slug))
         .route("/index/position-token-specs", get(position_token_specs))
         .route("/:symbol/book", get(get_book_by_symbol))
+        .route("/:symbol/trades", get(get_trades_by_symbol))
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,7 +76,7 @@ async fn get_book_by_symbol(
     Path(symbol): Path<String>,
     Query(query): Query<SpotBookQuery>,
 ) -> AppResult<Json<BookResponse>> {
-    let depth = query.depth.unwrap_or(10).clamp(1, 50);
+    let depth = query.depth.unwrap_or(10).clamp(1, DEFAULT_BOOK_DEPTH);
     let spot_market = resolve_spot_for_symbol(&state, &symbol).await?;
 
     if let Err(error) = crate::book_hydrate::rehydrate_spot_from_chain(
@@ -100,6 +103,14 @@ async fn get_book_by_symbol(
         .ok_or_else(|| AppError::NotFound(format!("order book for {spot_market} not found")))?;
 
     Ok(Json(book))
+}
+
+async fn get_trades_by_symbol(
+    State(state): State<AppState>,
+    Path(symbol): Path<String>,
+) -> AppResult<Json<Vec<RecentTrade>>> {
+    let spot_market = resolve_spot_for_symbol(&state, &symbol).await?;
+    Ok(Json(state.book_store.recent_trades(&spot_market).await))
 }
 
 async fn resolve_spot_for_symbol(state: &AppState, symbol: &str) -> AppResult<String> {

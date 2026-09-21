@@ -40,6 +40,8 @@ struct WireOrderCreatedEvent {
     creator: FlexibleAddress,
     market: FlexibleAddress,
     order_type: OrderEventType,
+    #[serde(default)]
+    cloid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +96,7 @@ impl WireOrderCreatedEvent {
             creator: parse_flexible_address(self.creator)?,
             market: parse_flexible_address(self.market)?,
             order_type: self.order_type,
+            cloid: self.cloid,
         })
     }
 }

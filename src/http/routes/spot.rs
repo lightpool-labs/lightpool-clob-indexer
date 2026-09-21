@@ -10,6 +10,7 @@ use lightpool_sdk::{parse_token_contract, Address};
 use serde::Deserialize;
 use std::str::FromStr;
 
+use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
 use crate::error::{AppError, AppResult};
 use crate::http::models::{BookResponse, MarketInfoResponse};
 use crate::state::AppState;
@@ -54,7 +55,7 @@ async fn get_book(
     Path(spot_market): Path<String>,
     Query(query): Query<SpotBookQuery>,
 ) -> AppResult<Json<BookResponse>> {
-    let depth = query.depth.unwrap_or(10).clamp(1, 50);
+    let depth = query.depth.unwrap_or(10).clamp(1, DEFAULT_BOOK_DEPTH);
 
     if let Err(error) = crate::book_hydrate::rehydrate_spot_from_chain(
         &state.chain,

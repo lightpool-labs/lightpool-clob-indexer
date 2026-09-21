@@ -16,4 +16,6 @@ pub struct Order {
     pub price: String,
     pub size: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloid: Option<String>,
 }

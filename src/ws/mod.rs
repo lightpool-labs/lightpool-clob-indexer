@@ -16,6 +16,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
+use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
 use crate::state::AppState;
 
 use models::{
@@ -114,7 +115,7 @@ async fn handle_request(
                             .await;
                         return true;
                     };
-                    let depth = request.depth.unwrap_or(10).clamp(1, 50);
+                    let depth = request.depth.unwrap_or(10).clamp(1, DEFAULT_BOOK_DEPTH);
                     process::subscribe_orderbook(state, sender, session, &spot_market, depth).await
                 }
                 CHANNEL_QUOTE => {

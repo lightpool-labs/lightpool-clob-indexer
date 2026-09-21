@@ -12,7 +12,7 @@ use crate::chain::ChainClient;
 use crate::error::{AppError, AppResult};
 use crate::indexer::{BookStore, SharedIndexStore};
 
-pub const DEFAULT_BOOK_DEPTH: u32 = 50;
+pub const DEFAULT_BOOK_DEPTH: u32 = 20;
 
 pub fn parse_query_account(value: &str) -> Address {
     Address::from_str(value.trim()).unwrap_or_else(|error| {
@@ -37,7 +37,7 @@ pub async fn hydrate_spot_from_chain(
     let spot = parse_token_contract(spot_market)
         .map_err(|e| AppError::BadRequest(format!("invalid spot market: {e}")))?;
 
-    let depth = depth.clamp(1, DEFAULT_BOOK_DEPTH);
+    let depth = depth.clamp(1, DEFAULT_BOOK_DEPTH).max(DEFAULT_BOOK_DEPTH);
     let chain_book = get_book_with_depth_fallback(chain, account, spot, depth).await?;
     let last_trade_price = if let Some(price) = index.last_trade_price(spot_market).await {
         Some(price)

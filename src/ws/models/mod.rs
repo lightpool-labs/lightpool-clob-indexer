@@ -6,7 +6,7 @@ mod quote;
 mod request;
 mod user;
 
-pub use orderbook::{BookLevelDelta, OrderBookDelta, OrderBookSnapshot};
+pub use orderbook::{BookLevelDelta, OrderBookDelta, OrderBookSnapshot, RecentTrade};
 pub use quote::{QuoteDelta, QuoteSnapshot};
 pub use request::{
     ws_error, ws_subscribed, ws_unsubscribed, WsRequest, CHANNEL_BARS, CHANNEL_ORDERBOOK_DELTA,

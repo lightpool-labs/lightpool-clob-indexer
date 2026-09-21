@@ -51,6 +51,7 @@ impl UserEventHub {
         event: &str,
         user_address: &str,
         chain_order_id: &str,
+        spot_market: &str,
         order: Order,
         block_num: u64,
     ) {
@@ -60,6 +61,7 @@ impl UserEventHub {
             user_address: user_address.to_string(),
             chain_order_id: chain_order_id.to_string(),
             block_num,
+            spot_market: spot_market.to_string(),
             order,
         }))
         .await;
@@ -79,6 +81,7 @@ impl UserEventHub {
         is_fully_filled: bool,
         spot_market: &str,
         block_num: u64,
+        cloid: Option<String>,
     ) {
         self.publish(UserWsMessage::Trade(UserTradeMessage {
             msg_type: "trade".into(),
@@ -94,6 +97,7 @@ impl UserEventHub {
             is_fully_filled,
             spot_market: spot_market.to_string(),
             block_num,
+            cloid,
         }))
         .await;
     }
