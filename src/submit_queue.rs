@@ -33,6 +33,7 @@ pub struct SubmitQueueConfig {
 #[derive(Clone)]
 pub struct SubmitQueue {
     sender: mpsc::Sender<SubmitJob>,
+    mempool: MempoolClient,
 }
 
 impl SubmitQueue {
@@ -43,6 +44,7 @@ impl SubmitQueue {
     ) -> Self {
         let (sender, mut receiver) = mpsc::channel::<SubmitJob>(config.capacity);
         let wait_timeout = config.wait_timeout;
+        let mempool_for_ingress = mempool.clone();
 
         tokio::spawn(async move {
             while let Some(job) = receiver.recv().await {
@@ -51,7 +53,7 @@ impl SubmitQueue {
                 let sender_addr = job.tx.transaction().sender();
                 let respond_to = job.respond_to;
 
-                if let Err(error) = mempool.submit_transaction(&job.tx).await {
+                if let Err(error) = mempool_for_ingress.submit_transaction(&job.tx).await {
                     submit_wait.cancel(&digest_hex);
                     tracing::warn!(
                         digest = %digest_hex,
@@ -97,7 +99,7 @@ impl SubmitQueue {
             wait_timeout_ms = wait_timeout.as_millis(),
             "submit queue started (mempool ingress + per-tx receipt wait tasks)"
         );
-        Self { sender }
+        Self { sender, mempool }
     }
 
     pub async fn submit(&self, tx: SignedTransaction) -> AppResult<SubmitTransactionResponse> {
@@ -110,6 +112,13 @@ impl SubmitQueue {
         response_rx
             .await
             .map_err(|_| AppError::Internal("submit task dropped".into()))?
+    }
+
+    /// Push to mempool and return digest. Does not wait for block receipt.
+    pub async fn inject(&self, tx: SignedTransaction) -> AppResult<String> {
+        let digest = hex::encode(tx.digest().as_bytes());
+        self.mempool.submit_transaction(&tx).await?;
+        Ok(digest)
     }
 }
 

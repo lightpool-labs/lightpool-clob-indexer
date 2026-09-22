@@ -7,7 +7,7 @@ use lightpool_sdk::lightpool_types::TransactionReceipt;
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitTxRequest {
-    10|    pub tx: lightpool_sdk::lightpool_types::SignedTransaction,
+    pub tx: lightpool_sdk::lightpool_types::SignedTransaction,
 }
 
 #[derive(Debug, serde::Serialize)]

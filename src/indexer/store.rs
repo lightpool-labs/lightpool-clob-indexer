@@ -17,6 +17,8 @@ pub struct IndexedBlockHead {
     pub tx_count: usize,
     pub connected: bool,
     pub catching_up: bool,
+    /// Unix ms when apply last finished a block (0 = never).
+    pub last_indexed_at_ms: u64,
 }
 
 pub type SharedIndexedBlockHead = Arc<RwLock<IndexedBlockHead>>;

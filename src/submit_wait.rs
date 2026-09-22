@@ -41,17 +41,21 @@ impl SubmitWaitRegistry {
         self.pending.remove(digest_hex);
     }
 
+    /// Completes a pending submit waiter. Clones `receipt` only when a waiter exists.
     pub fn complete(
         &self,
         digest_hex: &str,
         block_num: u64,
-        receipt: TransactionReceipt,
+        receipt: &TransactionReceipt,
     ) -> bool {
         let Some((_, sender)) = self.pending.remove(digest_hex) else {
             return false;
         };
         sender
-            .send(SubmitWaitResult { block_num, receipt })
+            .send(SubmitWaitResult {
+                block_num,
+                receipt: receipt.clone(),
+            })
             .is_ok()
     }
 }

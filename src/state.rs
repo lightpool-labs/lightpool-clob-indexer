@@ -20,7 +20,6 @@ use crate::ws::process::{SharedUserEventHub, UserEventHub};
 pub struct AppState {
     pub config: Config,
     pub chain: Arc<ChainClient>,
-    pub mempool: MempoolClient,
     pub submit_queue: SubmitQueue,
     pub submit_wait: SharedSubmitWaitRegistry,
     pub indexed_head: SharedIndexedBlockHead,
@@ -38,7 +37,7 @@ impl AppState {
         let mempool = MempoolClient::new(&config.lightpool_mempool_addr)
             .expect("invalid LIGHTPOOL_MEMPOOL_ADDR");
         let submit_queue = SubmitQueue::spawn(
-            mempool.clone(),
+            mempool,
             submit_wait.clone(),
             SubmitQueueConfig {
                 capacity: config.submit_queue_capacity,
@@ -59,7 +58,6 @@ impl AppState {
         Self {
             config,
             chain,
-            mempool,
             submit_queue,
             submit_wait,
             indexed_head: new_head(),

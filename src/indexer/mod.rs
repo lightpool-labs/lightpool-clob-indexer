@@ -6,6 +6,7 @@ mod processor;
 mod store;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,9 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 pub use book_store::BookStore;
-pub use processor::{apply_order_created_to_book, index_order_created, publish_user_order_created};
+pub use processor::{
+    apply_order_created_to_book, index_order_created, publish_user_order_created, ProcessOpts,
+};
 pub use store::{IndexStore, SharedIndexStore, SharedIndexedBlockHead, new_head};
 
 pub use book_store::SharedBookStore;
@@ -32,6 +35,9 @@ use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
 use processor::process_block;
+
+/// When apply backlog exceeds this, skip websocket fan-out to catch up faster.
+const QUIET_APPLY_BACKLOG: u64 = 8;
 
 pub type IndexApplyGate = Arc<Mutex<()>>;
 
@@ -269,6 +275,7 @@ pub async fn recover_from_persist(
             submit_wait,
             None,
             block,
+            ProcessOpts::quiet(),
         )
         .await;
         head = Some(PersistMeta { block_num, digest });
@@ -361,31 +368,80 @@ async fn run_once(
         return Ok(());
     }
 
+    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<ReceiptBlock>();
+    let apply_backlog = Arc::new(AtomicU64::new(0));
+    let apply_backlog_worker = apply_backlog.clone();
+    let apply_head = head.clone();
+    let apply_chain = chain.clone();
+    let apply_query = query_account.to_string();
+    let apply_index = index.clone();
+    let apply_book = book_store.clone();
+    let apply_hub = user_hub.clone();
+    let apply_wait = submit_wait.clone();
+    let apply_persist = persist.clone();
+    let apply_gate = apply_gate.clone();
+    let apply_bars = bar_store.clone();
+    let apply_cancel = cancel.clone();
+    let apply_worker = tokio::spawn(async move {
+        while let Some(block) = apply_rx.recv().await {
+            if apply_cancel.is_cancelled() {
+                break;
+            }
+            // Remaining queued blocks after taking this one.
+            let remaining = apply_backlog_worker
+                .fetch_sub(1, Ordering::Relaxed)
+                .saturating_sub(1);
+            let catching_up = apply_head.read().await.catching_up;
+            let quiet = catching_up || remaining >= QUIET_APPLY_BACKLOG;
+            if quiet && remaining > 0 && remaining.is_multiple_of(50) {
+                tracing::warn!(
+                    apply_backlog = remaining + 1,
+                    quiet,
+                    "indexer apply backlog; using quiet mode (no ws fan-out)"
+                );
+            }
+            apply_live_block(
+                block,
+                &apply_chain,
+                &apply_query,
+                &apply_head,
+                &apply_index,
+                &apply_book,
+                &apply_hub,
+                &apply_wait,
+                apply_persist.as_ref(),
+                apply_gate.as_ref(),
+                Some(&apply_bars),
+                if quiet {
+                    ProcessOpts::quiet()
+                } else {
+                    ProcessOpts::default()
+                },
+            )
+            .await;
+        }
+    });
+
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                drop(apply_tx);
+                let _ = apply_worker.await;
                 return Ok(());
             }
             message = receiver.recv() => {
                 match message {
                     Some(Message::NewBlock(block)) => {
-                        apply_live_block(
-                            block,
-                            chain,
-                            query_account,
-                            &head,
-                            &index,
-                            &book_store,
-                            &user_hub,
-                            &submit_wait,
-                            persist.as_ref(),
-                            apply_gate.as_ref(),
-                            Some(&bar_store),
-                        )
-                        .await;
+                        apply_backlog.fetch_add(1, Ordering::Relaxed);
+                        if apply_tx.send(block).is_err() {
+                            apply_backlog.fetch_sub(1, Ordering::Relaxed);
+                            break;
+                        }
                     }
                     Some(Message::Error(err)) => {
+                        drop(apply_tx);
+                        let _ = apply_worker.await;
                         return Err(AppError::Internal(format!("ws error: {err}")));
                     }
                     Some(Message::ReceiptBlock(_)) => {}
@@ -395,6 +451,8 @@ async fn run_once(
         }
     }
 
+    drop(apply_tx);
+    let _ = apply_worker.await;
     Ok(())
 }
 
@@ -550,6 +608,7 @@ async fn run_peer_catchup(
                 submit_wait,
                 None,
                 block,
+                ProcessOpts::quiet(),
             )
             .await;
             tip = PersistMeta {
@@ -565,11 +624,7 @@ async fn run_peer_catchup(
             }
             let block_num = block.block_num;
             let tx_count = block.transaction_outputs.len();
-            if let Ok(payload) = serde_json::to_vec(&block) {
-                if let Err(error) = persist.save_block(block_num, &digest, &payload) {
-                    tracing::error!(block_num, error = %error, "failed to persist buffered block");
-                }
-            }
+            persist.enqueue_receipt_block(block.clone());
             process_block(
                 chain,
                 query_account,
@@ -579,6 +634,7 @@ async fn run_peer_catchup(
                 submit_wait,
                 Some(bar_store),
                 block,
+                ProcessOpts::quiet(),
             )
             .await;
             applied_digests.insert(digest.clone());
@@ -590,6 +646,10 @@ async fn run_peer_catchup(
             state.block_num = block_num;
             state.digest = digest;
             state.tx_count = tx_count;
+            state.last_indexed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
         }
 
         {
@@ -620,30 +680,14 @@ async fn apply_live_block(
     persist: Option<&SharedPersist>,
     apply_gate: Option<&IndexApplyGate>,
     bar_store: Option<&SharedBarStore>,
+    opts: ProcessOpts,
 ) {
     let block_num = block.block_num;
     let digest = hex::encode(block.digest.as_bytes());
     let tx_count = block.transaction_outputs.len();
 
     if let Some(persist) = persist {
-        match serde_json::to_vec(&block) {
-            Ok(payload) => {
-                if let Err(error) = persist.save_block(block_num, &digest, &payload) {
-                    tracing::error!(
-                        block_num,
-                        error = %error,
-                        "failed to persist raw block"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::error!(
-                    block_num,
-                    error = %error,
-                    "failed to serialize block for sqlite"
-                );
-            }
-        }
+        persist.enqueue_receipt_block(block.clone());
     }
 
     {
@@ -660,6 +704,7 @@ async fn apply_live_block(
             submit_wait,
             bar_store,
             block,
+            opts,
         )
         .await;
 
@@ -667,5 +712,9 @@ async fn apply_live_block(
         state.block_num = block_num;
         state.digest = digest;
         state.tx_count = tx_count;
+        state.last_indexed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
     }
 }

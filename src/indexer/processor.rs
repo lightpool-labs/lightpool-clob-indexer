@@ -59,6 +59,25 @@ struct BlockOrderSyncStats {
     skipped_duplicates: u32,
 }
 
+/// Options for block apply throughput vs live fan-out.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessOpts {
+    /// When false, update book/index but skip book/user/bars websocket fan-out.
+    pub publish_ws: bool,
+}
+
+impl Default for ProcessOpts {
+    fn default() -> Self {
+        Self { publish_ws: true }
+    }
+}
+
+impl ProcessOpts {
+    pub fn quiet() -> Self {
+        Self { publish_ws: false }
+    }
+}
+
 pub async fn process_block(
     chain: &SharedChainClient,
     query_account: &str,
@@ -68,11 +87,21 @@ pub async fn process_block(
     submit_wait: &SharedSubmitWaitRegistry,
     bar_store: Option<&crate::bars::SharedBarStore>,
     block: ReceiptBlock,
+    opts: ProcessOpts,
 ) {
+    let block_num = block.block_num;
+    let block_digest = hex::encode(block.digest.as_bytes());
+    let tx_count = block.transaction_outputs.len();
+    let ok_count = block
+        .transaction_outputs
+        .iter()
+        .filter(|tx| tx.is_success())
+        .count();
+
     for tx_result in &block.transaction_outputs {
         // Match submit_queue register key: SignedTransaction digest (tx + signature).
         let digest = hex::encode(tx_result.signed_digest.as_bytes());
-        if !submit_wait.complete(&digest, block.block_num, tx_result.receipt.clone()) {
+        if !submit_wait.complete(&digest, block_num, &tx_result.receipt) {
             tracing::debug!(
                 digest,
                 "no pending submit waiter for transaction digest"
@@ -80,7 +109,6 @@ pub async fn process_block(
         }
     }
 
-    let block_num = block.block_num;
     let mut sync_stats = BlockOrderSyncStats::default();
 
     for tx_result in block.transaction_outputs {
@@ -95,7 +123,13 @@ pub async fn process_block(
                 continue;
             };
 
-            tracing::info!(action = action_name.as_str(), detail = %format_event_detail(event), "processing tx event");
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    action = action_name.as_str(),
+                    detail = %format_event_detail(event),
+                    "processing tx event"
+                );
+            }
 
             match action_name.as_str() {
                 "event_contract_created" => {
@@ -237,14 +271,18 @@ pub async fn process_block(
                                     "block_sync order_created skipped duplicate"
                                 );
                             } else {
-                                log_block_sync_order_created(
-                                    &mut sync_stats,
-                                    store,
-                                    block_num,
-                                    &created,
-                                    &spot_market,
-                                )
-                                .await;
+                                if opts.publish_ws {
+                                    log_block_sync_order_created(
+                                        &mut sync_stats,
+                                        store,
+                                        block_num,
+                                        &created,
+                                        &spot_market,
+                                    )
+                                    .await;
+                                } else {
+                                    sync_stats.created_total += 1;
+                                }
                                 if let Err(error) = ensure_chain_hydrated(
                                     chain,
                                     book_store,
@@ -269,17 +307,20 @@ pub async fn process_block(
                                     block_num,
                                     &created,
                                     &spot_market,
+                                    opts.publish_ws,
                                 )
                                 .await;
                                 index_order_created(store, created, &spot_market, None).await;
-                                publish_user_order_created(
-                                    user_hub,
-                                    store,
-                                    &spot_market,
-                                    &chain_order_id,
-                                    block_num,
-                                )
-                                .await;
+                                if opts.publish_ws {
+                                    publish_user_order_created(
+                                        user_hub,
+                                        store,
+                                        &spot_market,
+                                        &chain_order_id,
+                                        block_num,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -299,37 +340,42 @@ pub async fn process_block(
                                             cancelled.price,
                                             cancelled.cancelled_amount,
                                             block_num,
+                                            opts.publish_ws,
                                         )
                                         .await;
                                     store
                                         .update_order_cancelled(&spot_market, &chain_order_id)
                                         .await;
-                                    publish_user_order_cancelled(
-                                        user_hub,
-                                        store,
-                                        &spot_market,
-                                        &chain_order_id,
-                                        block_num,
-                                    )
-                                    .await;
+                                    if opts.publish_ws {
+                                        publish_user_order_cancelled(
+                                            user_hub,
+                                            store,
+                                            &spot_market,
+                                            &chain_order_id,
+                                            block_num,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 None => {
                                     tracing::warn!(
                                         order_id = chain_order_id,
-                                        "order_cancelled without indexed spot market; rehydrating all spot books from chain"
+                                        "order_cancelled without indexed spot market; skipping hydrate_all in quiet apply"
                                     );
-                                    if let Err(error) = hydrate_all_spot_markets(
-                                        chain,
-                                        book_store,
-                                        store,
-                                        query_account,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            error = %error,
-                                            "failed to rehydrate spot books after order_cancelled mapping miss"
-                                        );
+                                    if opts.publish_ws {
+                                        if let Err(error) = hydrate_all_spot_markets(
+                                            chain,
+                                            book_store,
+                                            store,
+                                            query_account,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                error = %error,
+                                                "failed to rehydrate spot books after order_cancelled mapping miss"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -369,6 +415,7 @@ pub async fn process_block(
                                             updated.new_amount,
                                             updated.remaining_amount,
                                             block_num,
+                                            opts.publish_ws,
                                         )
                                         .await;
                                     store
@@ -379,32 +426,36 @@ pub async fn process_block(
                                             updated.remaining_amount,
                                         )
                                         .await;
-                                    publish_user_order_updated(
-                                        user_hub,
-                                        store,
-                                        &spot_market,
-                                        &chain_order_id,
-                                        block_num,
-                                    )
-                                    .await;
+                                    if opts.publish_ws {
+                                        publish_user_order_updated(
+                                            user_hub,
+                                            store,
+                                            &spot_market,
+                                            &chain_order_id,
+                                            block_num,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 None => {
                                     tracing::warn!(
                                         order_id = chain_order_id,
-                                        "order_updated without indexed spot market; rehydrating all spot books from chain"
+                                        "order_updated without indexed spot market"
                                     );
-                                    if let Err(error) = hydrate_all_spot_markets(
-                                        chain,
-                                        book_store,
-                                        store,
-                                        query_account,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            error = %error,
-                                            "failed to rehydrate spot books after order_updated mapping miss"
-                                        );
+                                    if opts.publish_ws {
+                                        if let Err(error) = hydrate_all_spot_markets(
+                                            chain,
+                                            book_store,
+                                            store,
+                                            query_account,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                error = %error,
+                                                "failed to rehydrate spot books after order_updated mapping miss"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -420,17 +471,19 @@ pub async fn process_block(
                             store
                                 .record_last_trade_price(&spot_market, filled.price)
                                 .await;
-                            if let Some(bar_store) = bar_store {
-                                // Count buy-side fills only to avoid double-counting a match.
-                                if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
-                                    bar_store
-                                        .on_trade(
-                                            &spot_market,
-                                            filled.price,
-                                            filled.fill_amount,
-                                            crate::bars::BarStore::now_ts(),
-                                        )
-                                        .await;
+                            if opts.publish_ws {
+                                if let Some(bar_store) = bar_store {
+                                    // Count buy-side fills only to avoid double-counting a match.
+                                    if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
+                                        bar_store
+                                            .on_trade(
+                                                &spot_market,
+                                                filled.price,
+                                                filled.fill_amount,
+                                                crate::bars::BarStore::now_ts(),
+                                            )
+                                            .await;
+                                    }
                                 }
                             }
                             if let Err(error) = ensure_chain_hydrated(
@@ -457,6 +510,7 @@ pub async fn process_block(
                                     filled.fill_amount,
                                     block_num,
                                     filled.price,
+                                    opts.publish_ws,
                                 )
                                 .await;
                             store
@@ -481,21 +535,23 @@ pub async fn process_block(
                                     )
                                     .await;
                             }
-                            publish_user_order_filled(
-                                user_hub,
-                                store,
-                                &chain_order_id,
-                                &spot_market,
-                                filled.price,
-                                filled.fill_amount,
-                                filled.remaining_amount,
-                                filled.is_fully_filled,
-                                filled.side,
-                                block_num,
-                                filled.cloid.clone(),
-                                tx_result.sender().to_string(),
-                            )
-                            .await;
+                            if opts.publish_ws {
+                                publish_user_order_filled(
+                                    user_hub,
+                                    store,
+                                    &chain_order_id,
+                                    &spot_market,
+                                    filled.price,
+                                    filled.fill_amount,
+                                    filled.remaining_amount,
+                                    filled.is_fully_filled,
+                                    filled.side,
+                                    block_num,
+                                    filled.cloid.clone(),
+                                    tx_result.sender().to_string(),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -515,15 +571,31 @@ pub async fn process_block(
             "block_sync order_created summary"
         );
     }
+
+    // One line per non-empty block so operators can see indexer progress without per-tx spam.
+    if tx_count > 0 {
+        tracing::info!(
+            block_num,
+            digest = %block_digest,
+            tx_count,
+            ok_count,
+            publish_ws = opts.publish_ws,
+            "indexed block"
+        );
+    }
 }
 
 fn log_tx_result(tx_result: &TransactionResult) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
     let digest = hex::encode(tx_result.transaction_digest().as_bytes());
     let sender = tx_result.sender().to_string();
 
     match &tx_result.receipt.status {
         ExecutionStatus::Failure(msg) => {
-            tracing::info!(
+            tracing::debug!(
                 tx_digest = %digest,
                 sender = %sender,
                 success = false,
@@ -542,7 +614,7 @@ fn log_tx_result(tx_result: &TransactionResult) {
         .map(format_event_detail)
         .collect();
 
-    tracing::info!(
+    tracing::debug!(
         tx_digest = %digest,
         sender = %sender,
         success = true,
@@ -814,6 +886,7 @@ pub async fn apply_order_created_to_book(
     block_num: u64,
     created: &OrderCreatedEvent,
     spot_market: &str,
+    publish_ws: bool,
 ) {
     let OrderEventType::Limit { price, .. } = &created.order_type else {
         return;
@@ -826,6 +899,7 @@ pub async fn apply_order_created_to_book(
             *price,
             created.amount,
             block_num,
+            publish_ws,
         )
         .await;
 }
@@ -862,7 +936,7 @@ async fn index_spot_market_created(
     let spot_market = created.market_address.to_string();
     let name = created.name.to_string();
 
-    tracing::info!(
+    tracing::debug!(
         name = %name,
         spot_market = %spot_market,
         "indexed spot market"
@@ -918,7 +992,7 @@ async fn index_market_created(
         resolution_deadline: created.resolution_deadline,
     };
 
-    tracing::info!(
+    tracing::debug!(
         market_id = %market.id,
         slug = %market.slug,
         question = %market.question,
@@ -956,7 +1030,7 @@ async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEven
         is_closed: false,
     };
 
-    tracing::info!(
+    tracing::debug!(
         vault_id = %vault.id,
         name = %vault.name,
         vault_address = %vault.vault_address,
@@ -977,7 +1051,7 @@ pub async fn index_order_created(
     let (market_id, outcome) = match store.lookup_spot_market(spot_market).await {
         Some(mapped) => mapped,
         None => {
-            tracing::info!(
+            tracing::debug!(
                 spot_market,
                 order_id = %created.order_id,
                 "order_created for standalone spot market; registering for order index"
@@ -998,16 +1072,10 @@ pub async fn index_order_created(
     };
 
     let chain_order_id = created.order_id.to_string();
-    let question = store
-        .get_market(market_id)
-        .await
-        .map(|market| market.question)
-        .unwrap_or_default();
-    let market_slug = store
-        .get_market(market_id)
-        .await
-        .map(|market| market.slug)
-        .unwrap_or_default();
+    let (question, market_slug) = match store.get_market(market_id).await {
+        Some(market) => (market.question, market.slug),
+        None => (String::new(), String::new()),
+    };
     let normalized_spot = crate::spot_market::normalize_spot_market_key(spot_market);
     let (status, filled_raw) = status_override.unwrap_or_else(|| ("open".into(), 0));
     let order = Order {
@@ -1026,7 +1094,7 @@ pub async fn index_order_created(
         cloid: created.cloid.clone(),
     };
 
-    tracing::info!(
+    tracing::debug!(
         order_id = chain_order_id,
         market_id = %market_id,
         user = %created.creator,

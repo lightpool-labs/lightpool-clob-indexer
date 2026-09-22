@@ -297,6 +297,7 @@ async fn index_from_event(
             0,
             &event,
             &spot_market,
+            true,
         )
         .await;
     }

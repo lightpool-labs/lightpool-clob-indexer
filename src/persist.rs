@@ -2,13 +2,17 @@
 // Author: xiaoyu1998
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use lightpool_sdk::ReceiptBlock;
 use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::mpsc;
 
 use crate::domain::{Market, Order, Vault};
 use crate::error::{AppError, AppResult};
 use crate::indexer::{SharedBookStore, SharedIndexStore};
+use crate::peer::encode_block_payload;
 use crate::spot_market::normalize_spot_market_key;
 
 #[derive(Debug, Clone)]
@@ -27,6 +31,12 @@ pub struct ClosedBarRow {
 #[derive(Clone)]
 pub struct SharedPersist {
     inner: Arc<Mutex<PersistStore>>,
+    block_tx: mpsc::UnboundedSender<PersistBlockJob>,
+    pending_blocks: Arc<AtomicU64>,
+}
+
+struct PersistBlockJob {
+    block: ReceiptBlock,
 }
 
 struct PersistStore {
@@ -110,10 +120,29 @@ impl SharedPersist {
 
         let store = PersistStore { conn };
         store.migrate()?;
+        let inner = Arc::new(Mutex::new(store));
+        let pending_blocks = Arc::new(AtomicU64::new(0));
+        let block_tx = spawn_block_persist_worker(inner.clone(), pending_blocks.clone());
         tracing::info!(path = %path.display(), "sqlite persist opened");
         Ok(Self {
-            inner: Arc::new(Mutex::new(store)),
+            inner,
+            block_tx,
+            pending_blocks,
         })
+    }
+
+    /// Queue a live block for background bincode serialize + sqlite write.
+    /// Does not block the indexer apply path on serialization or disk I/O.
+    pub fn enqueue_receipt_block(&self, block: ReceiptBlock) {
+        self.pending_blocks.fetch_add(1, Ordering::Relaxed);
+        if self.block_tx.send(PersistBlockJob { block }).is_err() {
+            self.pending_blocks.fetch_sub(1, Ordering::Relaxed);
+            tracing::error!("block persist worker stopped; dropping receipt block");
+        }
+    }
+
+    pub fn persist_pending(&self) -> u64 {
+        self.pending_blocks.load(Ordering::Relaxed)
     }
 
     pub fn meta(&self) -> AppResult<Option<PersistMeta>> {
@@ -301,6 +330,40 @@ impl SharedPersist {
             .map_err(|_| AppError::Internal("sqlite mutex poisoned".into()))?;
         f(&guard)
     }
+}
+
+fn spawn_block_persist_worker(
+    inner: Arc<Mutex<PersistStore>>,
+    pending_blocks: Arc<AtomicU64>,
+) -> mpsc::UnboundedSender<PersistBlockJob> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<PersistBlockJob>();
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            let inner = inner.clone();
+            let block_num = job.block.block_num;
+            let result = tokio::task::spawn_blocking(move || {
+                let digest = hex::encode(job.block.digest.as_bytes());
+                let payload = encode_block_payload(&job.block)?;
+                let guard = inner
+                    .lock()
+                    .map_err(|_| AppError::Internal("sqlite mutex poisoned".into()))?;
+                guard.save_block(block_num, &digest, &payload)
+            })
+            .await;
+            pending_blocks.fetch_sub(1, Ordering::Relaxed);
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(block_num, error = %error, "async block persist failed");
+                }
+                Err(error) => {
+                    tracing::error!(block_num, error = %error, "async block persist task join failed");
+                }
+            }
+        }
+        tracing::info!("block persist worker stopped");
+    });
+    tx
 }
 
 async fn apply_snapshot_to_memory(

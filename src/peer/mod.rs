@@ -129,8 +129,19 @@ impl PeerClient {
 }
 
 pub fn decode_block_payload(block_num: u64, payload: &[u8]) -> AppResult<ReceiptBlock> {
-    serde_json::from_slice(payload)
-        .map_err(|e| AppError::Internal(format!("decode peer block {block_num}: {e}")))
+    match bincode::deserialize(payload) {
+        Ok(block) => Ok(block),
+        Err(bincode_error) => serde_json::from_slice(payload).map_err(|json_error| {
+            AppError::Internal(format!(
+                "decode peer block {block_num}: bincode={bincode_error}; json={json_error}"
+            ))
+        }),
+    }
+}
+
+pub fn encode_block_payload(block: &ReceiptBlock) -> AppResult<Vec<u8>> {
+    bincode::serialize(block)
+        .map_err(|e| AppError::Internal(format!("encode block payload: {e}")))
 }
 
 pub fn select_catchup_peer<'a>(

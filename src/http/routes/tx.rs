@@ -39,7 +39,7 @@ async fn inject_transaction(
         "inject HTTP request received"
     );
 
-    state.mempool.submit_transaction(&body.tx).await?;
+    state.submit_queue.inject(body.tx).await?;
 
     Ok(Json(InjectTxResponse { digest }))
 }

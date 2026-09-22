@@ -217,6 +217,7 @@ impl BookStore {
         price_raw: u64,
         amount_raw: u64,
         block_num: u64,
+        publish_ws: bool,
     ) {
         if price_raw == 0 || amount_raw == 0 {
             return;
@@ -233,7 +234,9 @@ impl BookStore {
             block_num,
             None,
         );
-        Self::publish_delta(&inner, delta);
+        if publish_ws {
+            Self::publish_delta(&inner, delta);
+        }
     }
 
     pub async fn apply_cancelled(
@@ -243,6 +246,7 @@ impl BookStore {
         price_raw: u64,
         amount_raw: u64,
         block_num: u64,
+        publish_ws: bool,
     ) {
         if price_raw == 0 || amount_raw == 0 {
             return;
@@ -259,7 +263,9 @@ impl BookStore {
             block_num,
             None,
         );
-        Self::publish_delta(&inner, delta);
+        if publish_ws {
+            Self::publish_delta(&inner, delta);
+        }
     }
 
     pub async fn apply_updated(
@@ -271,6 +277,7 @@ impl BookStore {
         new_amount_raw: u64,
         new_remaining_raw: u64,
         block_num: u64,
+        publish_ws: bool,
     ) {
         if price_raw == 0 {
             return;
@@ -307,7 +314,9 @@ impl BookStore {
                 None,
             )
         };
-        Self::publish_delta(&inner, delta);
+        if publish_ws {
+            Self::publish_delta(&inner, delta);
+        }
     }
 
     pub async fn apply_filled(
@@ -318,6 +327,7 @@ impl BookStore {
         fill_amount_raw: u64,
         block_num: u64,
         last_trade_price: u64,
+        publish_ws: bool,
     ) {
         if price_raw == 0 || fill_amount_raw == 0 {
             return;
@@ -353,7 +363,9 @@ impl BookStore {
                 }
             }
         }
-        Self::publish_delta(&inner, delta);
+        if publish_ws {
+            Self::publish_delta(&inner, delta);
+        }
     }
 
     pub async fn recent_trades(&self, spot_market: &str) -> Vec<RecentTrade> {
