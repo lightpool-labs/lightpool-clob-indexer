@@ -1,9 +1,17 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
+//! Submit path split into two stages:
+//!
+//! 1. **Ingress task** — register waiter, push bytes to mempool (wire ack only).
+//! 2. **Receipt wait tasks** — each accepted tx gets its own task that parks on
+//!    `SubmitWaitRegistry` until `process_block` completes the digest (or timeout).
+//!
+//! HTTP still returns the receipt; waiting no longer shares a `FuturesUnordered`
+//! with the mempool ingress loop (that coupling starved send under load).
+
 use std::time::Duration;
 
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
 use tokio::sync::{mpsc, oneshot};
@@ -37,49 +45,57 @@ impl SubmitQueue {
         let wait_timeout = config.wait_timeout;
 
         tokio::spawn(async move {
-            let mut waiting = FuturesUnordered::new();
+            while let Some(job) = receiver.recv().await {
+                let digest_hex = hex::encode(job.tx.digest().as_bytes());
+                let receipt_rx = submit_wait.register(&digest_hex);
+                let sender_addr = job.tx.transaction().sender();
+                let respond_to = job.respond_to;
 
-            loop {
-                tokio::select! {
-                    Some(job) = receiver.recv() => {
-                        let digest_hex = hex::encode(job.tx.digest().as_bytes());
-                        let receipt_rx = submit_wait.register(&digest_hex);
-                        let mempool = mempool.clone();
-                        let submit_wait = submit_wait.clone();
-                        let tx = job.tx;
-                        let respond_to = job.respond_to;
-
-                        waiting.push(async move {
-                            let result = submit_and_wait(
-                                &mempool,
-                                &submit_wait,
-                                &digest_hex,
-                                tx,
-                                receipt_rx,
-                                wait_timeout,
-                            )
-                            .await;
-                            (respond_to, result)
-                        });
-                    }
-                    Some((respond_to, result)) = waiting.next() => {
-                        if respond_to.send(result).is_err() {
-                            tracing::warn!(
-                                "submit HTTP client disconnected before receipt response was sent"
-                            );
-                        }
-                    }
-                    else => break,
+                if let Err(error) = mempool.submit_transaction(&job.tx).await {
+                    submit_wait.cancel(&digest_hex);
+                    tracing::warn!(
+                        digest = %digest_hex,
+                        sender = %sender_addr,
+                        error = %error,
+                        "mempool submit failed"
+                    );
+                    let _ = respond_to.send(Err(error));
+                    continue;
                 }
+
+                tracing::debug!(
+                    digest = %digest_hex,
+                    sender = %sender_addr,
+                    wait_timeout_ms = wait_timeout.as_millis(),
+                    "mempool submit accepted; handing off to receipt wait task"
+                );
+
+                let submit_wait = submit_wait.clone();
+                tokio::spawn(async move {
+                    let result = wait_for_receipt(
+                        &submit_wait,
+                        &digest_hex,
+                        sender_addr,
+                        receipt_rx,
+                        wait_timeout,
+                    )
+                    .await;
+                    if respond_to.send(result).is_err() {
+                        tracing::warn!(
+                            digest = %digest_hex,
+                            "submit HTTP client disconnected before receipt response was sent"
+                        );
+                    }
+                });
             }
 
-            tracing::info!("submit queue dispatcher stopped");
+            tracing::info!("submit queue ingress stopped");
         });
 
         tracing::info!(
             capacity = config.capacity,
             wait_timeout_ms = wait_timeout.as_millis(),
-            "submit queue dispatcher started"
+            "submit queue started (mempool ingress + per-tx receipt wait tasks)"
         );
         Self { sender }
     }
@@ -97,36 +113,16 @@ impl SubmitQueue {
     }
 }
 
-async fn submit_and_wait(
-    mempool: &MempoolClient,
+async fn wait_for_receipt(
     submit_wait: &SharedSubmitWaitRegistry,
     digest_hex: &str,
-    tx: SignedTransaction,
+    sender: lightpool_sdk::Address,
     receipt_rx: oneshot::Receiver<SubmitWaitResult>,
     wait_timeout: Duration,
 ) -> AppResult<SubmitTransactionResponse> {
-    let sender = tx.transaction().sender();
-    if let Err(error) = mempool.submit_transaction(&tx).await {
-        submit_wait.cancel(digest_hex);
-        tracing::warn!(
-            digest = digest_hex,
-            sender = %sender,
-            error = %error,
-            "mempool submit failed"
-        );
-        return Err(error);
-    }
-
-    tracing::info!(
-        digest = digest_hex,
-        sender = %sender,
-        wait_timeout_ms = wait_timeout.as_millis(),
-        "mempool submit accepted; waiting for receipt"
-    );
-
     match tokio::time::timeout(wait_timeout, receipt_rx).await {
         Ok(Ok(wait_result)) => {
-            tracing::info!(
+            tracing::debug!(
                 digest = digest_hex,
                 sender = %sender,
                 block_num = wait_result.block_num,

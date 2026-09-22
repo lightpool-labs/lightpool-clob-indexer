@@ -28,6 +28,8 @@ tokio-util = { version = "0.7", features = ["codec"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
 
 lightpool-sdk = { path = "../lightpool-sdk-rust" }
 
@@ -38,3 +40,7 @@ path = "src/main.rs"
 [[bin]]
 name = "checkpoint_bench"
 path = "src/bin/checkpoint_bench.rs"
+
+[[example]]
+name = "submit_repro"
+path = "examples/submit_repro.rs"

@@ -12,5 +12,5 @@ pub use accounts::{BalanceEntry, BalanceTokenSpec, BalancesRequest};
 pub use markets::MarketsPageResponse;
 pub use orders::{CancelContextResponse, ListedOrder, OrderQueryResponse};
 pub use spot::{BookResponse, MarketInfoResponse};
-pub use tx::{SubmitTxRequest, SubmitTxResponse};
+pub use tx::{InjectTxResponse, SubmitTxRequest, SubmitTxResponse};
 pub use vaults::VaultsPageResponse;
