@@ -26,13 +26,13 @@ pub async fn handle_subscribe(
         return true;
     }
 
-    let snapshot = state.bar_store.snapshot_ws(spot_market, 200).await;
+    let snapshot = state.index.bars.snapshot_ws(spot_market, 200).await;
     let text = serde_json::to_string(&snapshot).unwrap_or_default();
     if sender.send(Message::Text(text.into())).await.is_err() {
         return false;
     }
 
-    let rx = state.bar_store.subscribe(spot_market).await;
+    let rx = state.index.bars.subscribe(spot_market).await;
     session.subscribe_bars(spot_market.to_string(), rx);
 
     let _ = sender

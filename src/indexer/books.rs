@@ -1,13 +1,15 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
 use lightpool_sdk::lightpool_types::call::GetOrderBook;
 use lightpool_sdk::OrderSide;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 
 use crate::chain::{format_price_pieces, format_token_amount};
 use crate::domain::{BookLevel, BookSnapshot};
@@ -17,8 +19,9 @@ use crate::ws::models::{
 };
 
 const RECENT_TRADE_LIMIT: usize = 50;
+const BROADCAST_CAPACITY: usize = 4096;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct FillKey {
     block_num: u64,
     price_raw: u64,
@@ -31,30 +34,73 @@ struct SpotBook {
     asks: BTreeMap<u64, u64>,
     sequence: u64,
     last_trade_price: Option<u64>,
+    chain_hydrated: bool,
+    last_fill: Option<FillKey>,
+    trades: VecDeque<RecentTrade>,
 }
 
-#[derive(Default)]
-struct BookStoreInner {
-    books: HashMap<String, SpotBook>,
-    chain_hydrated: HashSet<String>,
-    publishers: HashMap<String, broadcast::Sender<OrderBookDelta>>,
-    quote_publishers: HashMap<String, broadcast::Sender<QuoteDelta>>,
-    trades: HashMap<String, VecDeque<RecentTrade>>,
-    last_fill: HashMap<String, FillKey>,
-    trade_seq: u64,
+struct MarketShard {
+    spot_market: String,
+    book: Mutex<SpotBook>,
+    orderbook_tx: broadcast::Sender<OrderBookDelta>,
+    quote_tx: broadcast::Sender<QuoteDelta>,
 }
 
-pub struct BookStore {
-    inner: RwLock<BookStoreInner>,
+impl MarketShard {
+    fn new(spot_market: String) -> Self {
+        let (orderbook_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (quote_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            spot_market,
+            book: Mutex::new(SpotBook::default()),
+            orderbook_tx,
+            quote_tx,
+        }
+    }
 }
 
-pub type SharedBookStore = Arc<BookStore>;
+/// Per-market sharded order books. Cross-market applies do not share one lock.
+pub struct Books {
+    shards: DashMap<String, Arc<MarketShard>>,
+    /// Globally unique recent-trade ids (cheap atomic; not under book locks).
+    trade_seq: AtomicU64,
+}
 
-impl BookStore {
+
+impl Books {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(BookStoreInner::default()),
+            shards: DashMap::new(),
+            trade_seq: AtomicU64::new(0),
         }
+    }
+
+    pub fn clear(&self) {
+        self.shards.clear();
+        self.trade_seq.store(0, Ordering::Relaxed);
+    }
+
+    fn key(spot_market: &str) -> String {
+        normalize_spot_market_key(spot_market)
+    }
+
+    fn shard(&self, spot_market: &str) -> Arc<MarketShard> {
+        let key = Self::key(spot_market);
+        if let Some(existing) = self.shards.get(&key) {
+            return existing.clone();
+        }
+        let shard = Arc::new(MarketShard::new(key.clone()));
+        match self.shards.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(shard.clone());
+                shard
+            }
+        }
+    }
+
+    fn try_shard(&self, spot_market: &str) -> Option<Arc<MarketShard>> {
+        self.shards.get(&Self::key(spot_market)).map(|s| s.clone())
     }
 
     pub async fn export_for_persist(
@@ -63,18 +109,21 @@ impl BookStore {
         Vec<crate::persist::PersistBookLevel>,
         Vec<crate::persist::PersistBookMeta>,
     ) {
-        let inner = self.inner.read().await;
         let mut levels = Vec::new();
         let mut metas = Vec::new();
-        for (spot_market, book) in &inner.books {
+        for entry in self.shards.iter() {
+            let shard = entry.value();
+            let Ok(book) = shard.book.lock() else {
+                continue;
+            };
             metas.push(crate::persist::PersistBookMeta {
-                spot_market: spot_market.clone(),
+                spot_market: shard.spot_market.clone(),
                 sequence: book.sequence,
                 last_trade_price: book.last_trade_price,
             });
             for (price_raw, size_raw) in &book.bids {
                 levels.push(crate::persist::PersistBookLevel {
-                    spot_market: spot_market.clone(),
+                    spot_market: shard.spot_market.clone(),
                     side: "buy".into(),
                     price_raw: *price_raw,
                     size_raw: *size_raw,
@@ -82,7 +131,7 @@ impl BookStore {
             }
             for (price_raw, size_raw) in &book.asks {
                 levels.push(crate::persist::PersistBookLevel {
-                    spot_market: spot_market.clone(),
+                    spot_market: shard.spot_market.clone(),
                     side: "sell".into(),
                     price_raw: *price_raw,
                     size_raw: *size_raw,
@@ -97,24 +146,26 @@ impl BookStore {
         levels: Vec<crate::persist::PersistBookLevel>,
         metas: Vec<crate::persist::PersistBookMeta>,
     ) {
-        let mut inner = self.inner.write().await;
-        inner.books.clear();
-        inner.chain_hydrated.clear();
+        self.shards.clear();
 
         for meta in metas {
-            let key = Self::key(&meta.spot_market);
-            let book = inner.books.entry(key.clone()).or_insert_with(SpotBook::default);
+            let shard = self.shard(&meta.spot_market);
+            let Ok(mut book) = shard.book.lock() else {
+                continue;
+            };
             book.sequence = meta.sequence;
             book.last_trade_price = meta.last_trade_price;
-            inner.chain_hydrated.insert(key);
+            book.chain_hydrated = true;
         }
 
         for level in levels {
             if level.size_raw == 0 {
                 continue;
             }
-            let key = Self::key(&level.spot_market);
-            let book = inner.books.entry(key.clone()).or_insert_with(SpotBook::default);
+            let shard = self.shard(&level.spot_market);
+            let Ok(mut book) = shard.book.lock() else {
+                continue;
+            };
             match level.side.as_str() {
                 "buy" => {
                     book.bids.insert(level.price_raw, level.size_raw);
@@ -124,58 +175,45 @@ impl BookStore {
                 }
                 _ => {}
             }
-            inner.chain_hydrated.insert(key);
+            book.chain_hydrated = true;
         }
     }
 
-    fn key(spot_market: &str) -> String {
-        normalize_spot_market_key(spot_market)
-    }
-
     pub async fn subscribe(&self, spot_market: &str) -> broadcast::Receiver<OrderBookDelta> {
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let sender = inner
-            .publishers
-            .entry(key.clone())
-            .or_insert_with(|| broadcast::channel(4096).0);
-        sender.subscribe()
+        self.shard(spot_market).orderbook_tx.subscribe()
     }
 
     pub async fn subscribe_quote(&self, spot_market: &str) -> broadcast::Receiver<QuoteDelta> {
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let sender = inner
-            .quote_publishers
-            .entry(key)
-            .or_insert_with(|| broadcast::channel(4096).0);
-        sender.subscribe()
+        self.shard(spot_market).quote_tx.subscribe()
     }
 
     pub async fn snapshot(&self, spot_market: &str, depth: u32) -> Option<BookSnapshot> {
-        let key = Self::key(spot_market);
-        let inner = self.inner.read().await;
-        let book = inner.books.get(&key)?;
-        Some(Self::book_to_response(book, depth))
+        let shard = self.try_shard(spot_market)?;
+        let book = shard.book.lock().ok()?;
+        Some(Self::book_to_response(&book, depth))
     }
 
     pub async fn ws_snapshot(&self, spot_market: &str, depth: u32) -> Option<OrderBookSnapshot> {
-        let key = Self::key(spot_market);
-        let inner = self.inner.read().await;
-        let book = inner.books.get(&key)?;
-        Some(Self::book_to_ws_snapshot(&key, book, depth))
+        let shard = self.try_shard(spot_market)?;
+        let book = shard.book.lock().ok()?;
+        Some(Self::book_to_ws_snapshot(&shard.spot_market, &book, depth))
     }
 
     pub async fn ws_quote_snapshot(&self, spot_market: &str) -> Option<QuoteSnapshot> {
-        let key = Self::key(spot_market);
-        let inner = self.inner.read().await;
-        let book = inner.books.get(&key)?;
-        Some(Self::book_to_quote_snapshot(&key, book))
+        let shard = self.try_shard(spot_market)?;
+        let book = shard.book.lock().ok()?;
+        Some(Self::book_to_quote_snapshot(&shard.spot_market, &book))
     }
 
     pub async fn is_chain_hydrated(&self, spot_market: &str) -> bool {
-        let key = Self::key(spot_market);
-        self.inner.read().await.chain_hydrated.contains(&key)
+        let Some(shard) = self.try_shard(spot_market) else {
+            return false;
+        };
+        shard
+            .book
+            .lock()
+            .map(|book| book.chain_hydrated)
+            .unwrap_or(false)
     }
 
     pub async fn hydrate_from_chain(
@@ -184,12 +222,10 @@ impl BookStore {
         chain_book: &GetOrderBook,
         last_trade_price: Option<u64>,
     ) {
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let book = inner
-            .books
-            .entry(key.clone())
-            .or_insert_with(SpotBook::default);
+        let shard = self.shard(spot_market);
+        let Ok(mut book) = shard.book.lock() else {
+            return;
+        };
 
         book.bids.clear();
         book.asks.clear();
@@ -207,7 +243,7 @@ impl BookStore {
         if let Some(price) = last_trade_price {
             book.last_trade_price = Some(price);
         }
-        inner.chain_hydrated.insert(key);
+        book.chain_hydrated = true;
     }
 
     pub async fn apply_created(
@@ -222,20 +258,28 @@ impl BookStore {
         if price_raw == 0 || amount_raw == 0 {
             return;
         }
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let delta = Self::apply_level_change(
-            &mut inner,
-            &key,
-            side,
-            price_raw,
-            amount_raw,
-            true,
-            block_num,
-            None,
-        );
+        let shard = self.shard(spot_market);
+        let (delta, quote) = {
+            let Ok(mut book) = shard.book.lock() else {
+                return;
+            };
+            let delta = Self::apply_level_change(
+                &mut book,
+                &shard.spot_market,
+                side,
+                price_raw,
+                amount_raw,
+                true,
+                block_num,
+                None,
+            );
+            let quote = delta.as_ref().map(|d| {
+                Self::quote_from_book(&shard.spot_market, d.block_num, &book)
+            });
+            (delta, quote)
+        };
         if publish_ws {
-            Self::publish_delta(&inner, delta);
+            Self::publish_delta(&shard, delta, quote);
         }
     }
 
@@ -251,20 +295,28 @@ impl BookStore {
         if price_raw == 0 || amount_raw == 0 {
             return;
         }
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let delta = Self::apply_level_change(
-            &mut inner,
-            &key,
-            side,
-            price_raw,
-            amount_raw,
-            false,
-            block_num,
-            None,
-        );
+        let shard = self.shard(spot_market);
+        let (delta, quote) = {
+            let Ok(mut book) = shard.book.lock() else {
+                return;
+            };
+            let delta = Self::apply_level_change(
+                &mut book,
+                &shard.spot_market,
+                side,
+                price_raw,
+                amount_raw,
+                false,
+                block_num,
+                None,
+            );
+            let quote = delta.as_ref().map(|d| {
+                Self::quote_from_book(&shard.spot_market, d.block_num, &book)
+            });
+            (delta, quote)
+        };
         if publish_ws {
-            Self::publish_delta(&inner, delta);
+            Self::publish_delta(&shard, delta, quote);
         }
     }
 
@@ -289,33 +341,41 @@ impl BookStore {
             return;
         }
 
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let delta = if new_remaining_raw > old_remaining_raw {
-            Self::apply_level_change(
-                &mut inner,
-                &key,
-                side,
-                price_raw,
-                new_remaining_raw - old_remaining_raw,
-                true,
-                block_num,
-                None,
-            )
-        } else {
-            Self::apply_level_change(
-                &mut inner,
-                &key,
-                side,
-                price_raw,
-                old_remaining_raw - new_remaining_raw,
-                false,
-                block_num,
-                None,
-            )
+        let shard = self.shard(spot_market);
+        let (delta, quote) = {
+            let Ok(mut book) = shard.book.lock() else {
+                return;
+            };
+            let delta = if new_remaining_raw > old_remaining_raw {
+                Self::apply_level_change(
+                    &mut book,
+                    &shard.spot_market,
+                    side,
+                    price_raw,
+                    new_remaining_raw - old_remaining_raw,
+                    true,
+                    block_num,
+                    None,
+                )
+            } else {
+                Self::apply_level_change(
+                    &mut book,
+                    &shard.spot_market,
+                    side,
+                    price_raw,
+                    old_remaining_raw - new_remaining_raw,
+                    false,
+                    block_num,
+                    None,
+                )
+            };
+            let quote = delta.as_ref().map(|d| {
+                Self::quote_from_book(&shard.spot_market, d.block_num, &book)
+            });
+            (delta, quote)
         };
         if publish_ws {
-            Self::publish_delta(&inner, delta);
+            Self::publish_delta(&shard, delta, quote);
         }
     }
 
@@ -332,61 +392,76 @@ impl BookStore {
         if price_raw == 0 || fill_amount_raw == 0 {
             return;
         }
-        let key = Self::key(spot_market);
-        let mut inner = self.inner.write().await;
-        let mut delta = Self::apply_level_change(
-            &mut inner,
-            &key,
-            side,
-            price_raw,
-            fill_amount_raw,
-            false,
-            block_num,
-            Some(last_trade_price),
-        );
-        let fill_key = FillKey {
-            block_num,
-            price_raw,
-            size_raw: fill_amount_raw,
-        };
-        let duplicate = inner.last_fill.get(&key).is_some_and(|prev| {
-            prev.block_num == fill_key.block_num
-                && prev.price_raw == fill_key.price_raw
-                && prev.size_raw == fill_key.size_raw
-        });
-        inner.last_fill.insert(key.clone(), fill_key);
-        if !duplicate {
-            if let Some(trade) = Self::push_trade(&mut inner, &key, side, price_raw, fill_amount_raw, block_num)
-            {
-                if let Some(delta) = delta.as_mut() {
-                    delta.trade = Some(trade);
+        let shard = self.shard(spot_market);
+        let (delta, quote) = {
+            let Ok(mut book) = shard.book.lock() else {
+                return;
+            };
+            let mut delta = Self::apply_level_change(
+                &mut book,
+                &shard.spot_market,
+                side,
+                price_raw,
+                fill_amount_raw,
+                false,
+                block_num,
+                Some(last_trade_price),
+            );
+            let fill_key = FillKey {
+                block_num,
+                price_raw,
+                size_raw: fill_amount_raw,
+            };
+            let duplicate = book.last_fill.is_some_and(|prev| {
+                prev.block_num == fill_key.block_num
+                    && prev.price_raw == fill_key.price_raw
+                    && prev.size_raw == fill_key.size_raw
+            });
+            book.last_fill = Some(fill_key);
+            if !duplicate {
+                if let Some(trade) = Self::push_trade(
+                    &self.trade_seq,
+                    &mut book,
+                    side,
+                    price_raw,
+                    fill_amount_raw,
+                    block_num,
+                ) {
+                    if let Some(delta) = delta.as_mut() {
+                        delta.trade = Some(trade);
+                    }
                 }
             }
-        }
+            let quote = delta.as_ref().map(|d| {
+                Self::quote_from_book(&shard.spot_market, d.block_num, &book)
+            });
+            (delta, quote)
+        };
         if publish_ws {
-            Self::publish_delta(&inner, delta);
+            Self::publish_delta(&shard, delta, quote);
         }
     }
 
     pub async fn recent_trades(&self, spot_market: &str) -> Vec<RecentTrade> {
-        let key = Self::key(spot_market);
-        let inner = self.inner.read().await;
-        inner
-            .trades
-            .get(&key)
-            .map(|trades| trades.iter().cloned().collect())
+        let Some(shard) = self.try_shard(spot_market) else {
+            return Vec::new();
+        };
+        shard
+            .book
+            .lock()
+            .map(|book| book.trades.iter().cloned().collect())
             .unwrap_or_default()
     }
 
     fn push_trade(
-        inner: &mut BookStoreInner,
-        spot_market: &str,
+        trade_seq: &AtomicU64,
+        book: &mut SpotBook,
         side: OrderSide,
         price_raw: u64,
         size_raw: u64,
         block_num: u64,
     ) -> Option<RecentTrade> {
-        inner.trade_seq = inner.trade_seq.saturating_add(1);
+        let id = trade_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let side = match side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
@@ -396,23 +471,22 @@ impl BookStore {
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
         let trade = RecentTrade {
-            id: inner.trade_seq,
+            id,
             side: side.into(),
             price: format_price_pieces(price_raw),
             size: format_token_amount(size_raw),
             time_ms,
             block_num,
         };
-        let trades = inner.trades.entry(spot_market.to_string()).or_default();
-        trades.push_front(trade.clone());
-        while trades.len() > RECENT_TRADE_LIMIT {
-            trades.pop_back();
+        book.trades.push_front(trade.clone());
+        while book.trades.len() > RECENT_TRADE_LIMIT {
+            book.trades.pop_back();
         }
         Some(trade)
     }
 
     fn apply_level_change(
-        inner: &mut BookStoreInner,
+        book: &mut SpotBook,
         spot_market: &str,
         side: OrderSide,
         price_raw: u64,
@@ -421,10 +495,6 @@ impl BookStore {
         block_num: u64,
         last_trade_price: Option<u64>,
     ) -> Option<OrderBookDelta> {
-        let book = inner
-            .books
-            .entry(spot_market.to_string())
-            .or_insert_with(SpotBook::default);
         let levels = match side {
             OrderSide::Buy => &mut book.bids,
             OrderSide::Sell => &mut book.asks,
@@ -475,22 +545,16 @@ impl BookStore {
         })
     }
 
-    fn publish_delta(inner: &BookStoreInner, delta: Option<OrderBookDelta>) {
-        let Some(delta) = delta else {
-            return;
-        };
-        if let Some(sender) = inner.publishers.get(&delta.spot_market) {
-            let _ = sender.send(delta.clone());
+    fn publish_delta(
+        shard: &MarketShard,
+        delta: Option<OrderBookDelta>,
+        quote: Option<QuoteDelta>,
+    ) {
+        if let Some(delta) = delta {
+            let _ = shard.orderbook_tx.send(delta);
         }
-        if let Some(book) = inner.books.get(&delta.spot_market) {
-            Self::publish_quote(inner, &delta.spot_market, delta.block_num, book);
-        }
-    }
-
-    fn publish_quote(inner: &BookStoreInner, spot_market: &str, block_num: u64, book: &SpotBook) {
-        let quote = Self::quote_from_book(spot_market, block_num, book);
-        if let Some(sender) = inner.quote_publishers.get(spot_market) {
-            let _ = sender.send(quote);
+        if let Some(quote) = quote {
+            let _ = shard.quote_tx.send(quote);
         }
     }
 

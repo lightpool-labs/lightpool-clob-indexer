@@ -7,7 +7,7 @@ use axum::extract::ws::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::indexer::SharedBookStore;
+use crate::indexer::SharedIndexState;
 use crate::spot_market::normalize_spot_market_key;
 use crate::ws::models::{OrderBookDelta, QuoteDelta, UserWsMessage};
 use crate::bars::BarWsMessage;
@@ -37,7 +37,7 @@ impl WsSession {
         &mut self,
         spot_market: String,
         mut rx: broadcast::Receiver<OrderBookDelta>,
-        book_store: SharedBookStore,
+        index: SharedIndexState,
         depth: u32,
     ) {
         self.cancel(SubscriptionKey::Orderbook(spot_market.clone()));
@@ -59,7 +59,8 @@ impl WsSession {
                             skipped,
                             "orderbook delta receiver lagged; sending snapshot resync"
                         );
-                        if let Some(snapshot) = book_store
+                        if let Some(snapshot) = index
+                            .books
                             .ws_snapshot(&normalized_spot_market, depth)
                             .await
                         {

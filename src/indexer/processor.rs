@@ -1,6 +1,9 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
+use std::collections::HashMap;
+
+use futures_util::future::join_all;
 use lightpool_sdk::event_contract_events::{
     EventContractBurnedEvent, EventContractCreatedEvent, EventContractMintedEvent,
     EventContractRedeemedEvent, EventContractResolvedEvent,
@@ -29,8 +32,7 @@ use crate::domain::{Market, Order, Vault};
 use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
-use super::book_store::SharedBookStore;
-use super::store::{market_uuid, vault_uuid, SharedIndexStore};
+use super::index_state::{market_uuid, vault_uuid, SharedIndexState};
 
 fn spot_market_from_event_contract(event: &TransactionEvent) -> Option<String> {
     event
@@ -40,7 +42,7 @@ fn spot_market_from_event_contract(event: &TransactionEvent) -> Option<String> {
 }
 
 async fn resolve_spot_market_for_order_event(
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     event: &TransactionEvent,
     chain_order_id: &str,
 ) -> Option<String> {
@@ -78,17 +80,38 @@ impl ProcessOpts {
     }
 }
 
-pub async fn process_block(
-    chain: &SharedChainClient,
-    query_account: &str,
-    store: &SharedIndexStore,
-    book_store: &SharedBookStore,
-    user_hub: &SharedUserEventHub,
-    submit_wait: &SharedSubmitWaitRegistry,
-    bar_store: Option<&crate::bars::SharedBarStore>,
-    block: ReceiptBlock,
-    opts: ProcessOpts,
-) {
+/// Per-market order work decoded in the pipeline decode stage.
+#[derive(Debug)]
+pub enum MarketOrderEvent {
+    Created(OrderCreatedEvent),
+    Cancelled(OrderCancelledEvent),
+    Updated(OrderUpdatedEvent),
+    Filled {
+        filled: OrderFilledEvent,
+        tx_sender: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum UnmappedOrderEvent {
+    Cancelled { chain_order_id: String },
+    Updated { chain_order_id: String },
+}
+
+/// Block ready for apply: globals still on `block`; order events grouped by market.
+#[derive(Debug)]
+pub struct PreparedBlock {
+    pub block_num: u64,
+    pub block_digest: String,
+    pub tx_count: usize,
+    pub ok_count: usize,
+    pub block: ReceiptBlock,
+    pub markets: HashMap<String, Vec<MarketOrderEvent>>,
+    pub unmapped: Vec<UnmappedOrderEvent>,
+}
+
+/// Decode/classify stage: parse order payloads and group by `spot_market`.
+pub async fn prepare_block(store: &SharedIndexState, block: ReceiptBlock) -> PreparedBlock {
     let block_num = block.block_num;
     let block_digest = hex::encode(block.digest.as_bytes());
     let tx_count = block.transaction_outputs.len();
@@ -98,8 +121,141 @@ pub async fn process_block(
         .filter(|tx| tx.is_success())
         .count();
 
+    let mut markets: HashMap<String, Vec<MarketOrderEvent>> = HashMap::new();
+    let mut unmapped = Vec::new();
+
     for tx_result in &block.transaction_outputs {
-        // Match submit_queue register key: SignedTransaction digest (tx + signature).
+        if !tx_result.is_success() {
+            continue;
+        }
+        let tx_sender = tx_result.sender().to_string();
+        for event in &tx_result.receipt.events {
+            let EventType::Call(action_name) = &event.event_type else {
+                continue;
+            };
+            let EventData::Bytes(data) = &event.data else {
+                continue;
+            };
+            match action_name.as_str() {
+                "order_created" => {
+                    if let Ok(created) = bincode::deserialize::<OrderCreatedEvent>(data) {
+                        let spot_market = crate::spot_market::normalize_spot_market_key(
+                            &created.market.to_string(),
+                        );
+                        markets
+                            .entry(spot_market)
+                            .or_default()
+                            .push(MarketOrderEvent::Created(created));
+                    }
+                }
+                "order_cancelled" => {
+                    if let Ok(cancelled) = bincode::deserialize::<OrderCancelledEvent>(data) {
+                        let chain_order_id = cancelled.order_id.to_string();
+                        match resolve_spot_market_for_order_event(store, event, &chain_order_id)
+                            .await
+                        {
+                            Some(spot_market) => {
+                                markets
+                                    .entry(spot_market)
+                                    .or_default()
+                                    .push(MarketOrderEvent::Cancelled(cancelled));
+                            }
+                            None => unmapped.push(UnmappedOrderEvent::Cancelled { chain_order_id }),
+                        }
+                    }
+                }
+                "order_updated" => {
+                    if let Ok(updated) = bincode::deserialize::<OrderUpdatedEvent>(data) {
+                        let chain_order_id = updated.order_id.to_string();
+                        match resolve_spot_market_for_order_event(store, event, &chain_order_id)
+                            .await
+                        {
+                            Some(spot_market) => {
+                                markets
+                                    .entry(spot_market)
+                                    .or_default()
+                                    .push(MarketOrderEvent::Updated(updated));
+                            }
+                            None => unmapped.push(UnmappedOrderEvent::Updated { chain_order_id }),
+                        }
+                    }
+                }
+                "order_filled" => {
+                    if let Ok(filled) = bincode::deserialize::<OrderFilledEvent>(data) {
+                        let spot_market = crate::spot_market::normalize_spot_market_key(
+                            &filled.market.to_string(),
+                        );
+                        markets.entry(spot_market).or_default().push(
+                            MarketOrderEvent::Filled {
+                                filled,
+                                tx_sender: tx_sender.clone(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    tracing::debug!(
+        block_num,
+        markets = markets.len(),
+        order_events = markets.values().map(|v| v.len()).sum::<usize>(),
+        unmapped = unmapped.len(),
+        "prepared block for parallel market apply"
+    );
+
+    PreparedBlock {
+        block_num,
+        block_digest,
+        tx_count,
+        ok_count,
+        block,
+        markets,
+        unmapped,
+    }
+}
+
+pub async fn process_block(
+    chain: &SharedChainClient,
+    query_account: &str,
+    store: &SharedIndexState,
+    user_hub: &SharedUserEventHub,
+    submit_wait: &SharedSubmitWaitRegistry,
+    block: ReceiptBlock,
+    opts: ProcessOpts,
+) {
+    let prepared = prepare_block(store, block).await;
+    process_prepared_block(
+        chain,
+        query_account,
+        store,
+        user_hub,
+        submit_wait,
+        prepared,
+        opts,
+    )
+    .await;
+}
+
+pub async fn process_prepared_block(
+    chain: &SharedChainClient,
+    query_account: &str,
+    store: &SharedIndexState,
+    user_hub: &SharedUserEventHub,
+    submit_wait: &SharedSubmitWaitRegistry,
+    prepared: PreparedBlock,
+    opts: ProcessOpts,
+) {
+    let block_num = prepared.block_num;
+    let tx_count = prepared.tx_count;
+    let ok_count = prepared.ok_count;
+    let markets = prepared.markets;
+    let unmapped = prepared.unmapped;
+    let block = prepared.block;
+
+    for tx_result in &block.transaction_outputs {
         let digest = hex::encode(tx_result.signed_digest.as_bytes());
         if !submit_wait.complete(&digest, block_num, &tx_result.receipt) {
             tracing::debug!(
@@ -109,20 +265,22 @@ pub async fn process_block(
         }
     }
 
-    let mut sync_stats = BlockOrderSyncStats::default();
-
-    for tx_result in block.transaction_outputs {
-        log_tx_result(&tx_result);
-
+    // Global / non-order events stay serial (shared index metadata).
+    for tx_result in &block.transaction_outputs {
+        log_tx_result(tx_result);
         if !tx_result.is_success() {
             continue;
         }
-
         for event in &tx_result.receipt.events {
             let EventType::Call(action_name) = &event.event_type else {
                 continue;
             };
-
+            if matches!(
+                action_name.as_str(),
+                "order_created" | "order_cancelled" | "order_updated" | "order_filled"
+            ) {
+                continue;
+            }
             if tracing::enabled!(tracing::Level::DEBUG) {
                 tracing::debug!(
                     action = action_name.as_str(),
@@ -130,434 +288,84 @@ pub async fn process_block(
                     "processing tx event"
                 );
             }
+            apply_global_event(
+                chain,
+                query_account,
+                store,
+                action_name.as_str(),
+                event,
+            )
+            .await;
+        }
+    }
 
-            match action_name.as_str() {
-                "event_contract_created" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        match bincode::deserialize::<EventContractCreatedEvent>(data) {
-                            Ok(created) => {
-                                index_market_created(
-                                    chain,
-                                    query_account,
-                                    store,
-                                    book_store,
-                                    created,
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "failed to decode event_contract_created"
-                                );
-                            }
-                        }
+    for item in &unmapped {
+        match item {
+            UnmappedOrderEvent::Cancelled { chain_order_id } => {
+                tracing::warn!(
+                    order_id = %chain_order_id,
+                    "order_cancelled without indexed spot market; skipping hydrate_all in quiet apply"
+                );
+                if opts.publish_ws {
+                    if let Err(error) =
+                        hydrate_all_spot_markets(chain, store, query_account).await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to rehydrate spot books after order_cancelled mapping miss"
+                        );
                     }
                 }
-                "event_contract_resolved" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(resolved) =
-                            bincode::deserialize::<EventContractResolvedEvent>(data)
-                        {
-                            store
-                                .update_market_state(
-                                    &resolved.market_address.to_string(),
-                                    "Resolved",
-                                )
-                                .await;
-                        }
+            }
+            UnmappedOrderEvent::Updated { chain_order_id } => {
+                tracing::warn!(
+                    order_id = %chain_order_id,
+                    "order_updated without indexed spot market"
+                );
+                if opts.publish_ws {
+                    if let Err(error) =
+                        hydrate_all_spot_markets(chain, store, query_account).await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to rehydrate spot books after order_updated mapping miss"
+                        );
                     }
                 }
-                "vault_created" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        match bincode::deserialize::<VaultCreatedEvent>(data) {
-                            Ok(created) => {
-                                index_vault_created(store, created).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to decode vault_created");
-                            }
-                        }
-                    }
-                }
-                "vault_deposited" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(deposited) = bincode::deserialize::<VaultDepositedEvent>(data) {
-                            store
-                                .update_vault_equity(
-                                    &deposited.vault.to_string(),
-                                    &format_token_amount(deposited.equity),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                "vault_withdrawn" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(withdrawn) = bincode::deserialize::<VaultWithdrawnEvent>(data) {
-                            store
-                                .update_vault_equity(
-                                    &withdrawn.vault.to_string(),
-                                    &format_token_amount(withdrawn.equity),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                "vault_manager_updated" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(updated) =
-                            bincode::deserialize::<VaultManagerUpdatedEvent>(data)
-                        {
-                            store
-                                .update_vault_manager(
-                                    &updated.vault.to_string(),
-                                    &updated.new_manager.to_string(),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                "vault_deposit_permission_updated" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(updated) =
-                            bincode::deserialize::<VaultDepositPermissionUpdatedEvent>(data)
-                        {
-                            store
-                                .update_vault_allow_deposit(
-                                    &updated.vault.to_string(),
-                                    updated.allow_deposit,
-                                )
-                                .await;
-                        }
-                    }
-                }
-                "vault_closed" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(closed) = bincode::deserialize::<VaultClosedEvent>(data) {
-                            store.mark_vault_closed(&closed.vault.to_string()).await;
-                        }
-                    }
-                }
-                "market_created" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        match bincode::deserialize::<MarketCreatedEvent>(data) {
-                            Ok(created) => {
-                                index_spot_market_created(store, book_store, chain, query_account, created)
-                                    .await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "failed to decode market_created");
-                            }
-                        }
-                    }
-                }
-                "order_created" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(created) = bincode::deserialize::<OrderCreatedEvent>(data) {
-                            let chain_order_id = created.order_id.to_string();
-                            let spot_market = crate::spot_market::normalize_spot_market_key(
-                                &created.market.to_string(),
-                            );
-                            if store
-                                .has_chain_order(&spot_market, &chain_order_id)
-                                .await
-                            {
-                                sync_stats.skipped_duplicates += 1;
-                                tracing::warn!(
-                                    block_num,
-                                    order_id = chain_order_id,
-                                    spot_market,
-                                    "block_sync order_created skipped duplicate"
-                                );
-                            } else {
-                                if opts.publish_ws {
-                                    log_block_sync_order_created(
-                                        &mut sync_stats,
-                                        store,
-                                        block_num,
-                                        &created,
-                                        &spot_market,
-                                    )
-                                    .await;
-                                } else {
-                                    sync_stats.created_total += 1;
-                                }
-                                if let Err(error) = ensure_chain_hydrated(
-                                    chain,
-                                    book_store,
-                                    store,
-                                    query_account,
-                                    &spot_market,
-                                    DEFAULT_BOOK_DEPTH,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        spot_market,
-                                        error = %error,
-                                        "failed to hydrate book before order_created"
-                                    );
-                                }
-                                // Always apply the event delta. Hydrate is best-effort; if get_book
-                                // RPC is unavailable, skipping apply leaves an empty book forever.
-                                apply_order_created_to_book(
-                                    book_store,
-                                    store,
-                                    block_num,
-                                    &created,
-                                    &spot_market,
-                                    opts.publish_ws,
-                                )
-                                .await;
-                                index_order_created(store, created, &spot_market, None).await;
-                                if opts.publish_ws {
-                                    publish_user_order_created(
-                                        user_hub,
-                                        store,
-                                        &spot_market,
-                                        &chain_order_id,
-                                        block_num,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                }
-                "order_cancelled" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(cancelled) = bincode::deserialize::<OrderCancelledEvent>(data) {
-                            let chain_order_id = cancelled.order_id.to_string();
-                            match resolve_spot_market_for_order_event(store, event, &chain_order_id)
-                                .await
-                            {
-                                Some(spot_market) => {
-                                    book_store
-                                        .apply_cancelled(
-                                            &spot_market,
-                                            cancelled.side,
-                                            cancelled.price,
-                                            cancelled.cancelled_amount,
-                                            block_num,
-                                            opts.publish_ws,
-                                        )
-                                        .await;
-                                    store
-                                        .update_order_cancelled(&spot_market, &chain_order_id)
-                                        .await;
-                                    if opts.publish_ws {
-                                        publish_user_order_cancelled(
-                                            user_hub,
-                                            store,
-                                            &spot_market,
-                                            &chain_order_id,
-                                            block_num,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        order_id = chain_order_id,
-                                        "order_cancelled without indexed spot market; skipping hydrate_all in quiet apply"
-                                    );
-                                    if opts.publish_ws {
-                                        if let Err(error) = hydrate_all_spot_markets(
-                                            chain,
-                                            book_store,
-                                            store,
-                                            query_account,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                error = %error,
-                                                "failed to rehydrate spot books after order_cancelled mapping miss"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                "order_updated" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(updated) = bincode::deserialize::<OrderUpdatedEvent>(data) {
-                            let chain_order_id = updated.order_id.to_string();
-                            match resolve_spot_market_for_order_event(store, event, &chain_order_id)
-                                .await
-                            {
-                                Some(spot_market) => {
-                                    if let Err(error) = ensure_chain_hydrated(
-                                        chain,
-                                        book_store,
-                                        store,
-                                        query_account,
-                                        &spot_market,
-                                        DEFAULT_BOOK_DEPTH,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            spot_market,
-                                            error = %error,
-                                            "failed to hydrate book before order_updated"
-                                        );
-                                    }
-                                    book_store
-                                        .apply_updated(
-                                            &spot_market,
-                                            updated.side,
-                                            updated.price,
-                                            updated.old_amount,
-                                            updated.new_amount,
-                                            updated.remaining_amount,
-                                            block_num,
-                                            opts.publish_ws,
-                                        )
-                                        .await;
-                                    store
-                                        .update_order_amount(
-                                            &spot_market,
-                                            &chain_order_id,
-                                            updated.new_amount,
-                                            updated.remaining_amount,
-                                        )
-                                        .await;
-                                    if opts.publish_ws {
-                                        publish_user_order_updated(
-                                            user_hub,
-                                            store,
-                                            &spot_market,
-                                            &chain_order_id,
-                                            block_num,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        order_id = chain_order_id,
-                                        "order_updated without indexed spot market"
-                                    );
-                                    if opts.publish_ws {
-                                        if let Err(error) = hydrate_all_spot_markets(
-                                            chain,
-                                            book_store,
-                                            store,
-                                            query_account,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(
-                                                error = %error,
-                                                "failed to rehydrate spot books after order_updated mapping miss"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                "order_filled" => {
-                    if let EventData::Bytes(data) = &event.data {
-                        if let Ok(filled) = bincode::deserialize::<OrderFilledEvent>(data) {
-                            let chain_order_id = filled.order_id.to_string();
-                            let spot_market =
-                                crate::spot_market::normalize_spot_market_key(&filled.market.to_string());
-                            store
-                                .record_last_trade_price(&spot_market, filled.price)
-                                .await;
-                            if opts.publish_ws {
-                                if let Some(bar_store) = bar_store {
-                                    // Count buy-side fills only to avoid double-counting a match.
-                                    if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
-                                        bar_store
-                                            .on_trade(
-                                                &spot_market,
-                                                filled.price,
-                                                filled.fill_amount,
-                                                crate::bars::BarStore::now_ts(),
-                                            )
-                                            .await;
-                                    }
-                                }
-                            }
-                            if let Err(error) = ensure_chain_hydrated(
-                                chain,
-                                book_store,
-                                store,
-                                query_account,
-                                &spot_market,
-                                DEFAULT_BOOK_DEPTH,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    spot_market,
-                                    error = %error,
-                                    "failed to hydrate book before order_filled"
-                                );
-                            }
-                            book_store
-                                .apply_filled(
-                                    &spot_market,
-                                    filled.side,
-                                    filled.price,
-                                    filled.fill_amount,
-                                    block_num,
-                                    filled.price,
-                                    opts.publish_ws,
-                                )
-                                .await;
-                            store
-                                .update_order_fill(
-                                    &spot_market,
-                                    &chain_order_id,
-                                    filled.fill_amount,
-                                    filled.remaining_amount,
-                                    filled.is_fully_filled,
-                                )
-                                .await;
-                            if let Some((_, user_address, _)) = store
-                                .stored_order_by_chain_id(&spot_market, &chain_order_id)
-                                .await
-                            {
-                                store
-                                    .apply_vault_fill_to_portfolio(
-                                        &user_address,
-                                        &spot_market,
-                                        filled.side,
-                                        filled.fill_amount,
-                                    )
-                                    .await;
-                            }
-                            if opts.publish_ws {
-                                publish_user_order_filled(
-                                    user_hub,
-                                    store,
-                                    &chain_order_id,
-                                    &spot_market,
-                                    filled.price,
-                                    filled.fill_amount,
-                                    filled.remaining_amount,
-                                    filled.is_fully_filled,
-                                    filled.side,
-                                    block_num,
-                                    filled.cloid.clone(),
-                                    tx_result.sender().to_string(),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
         }
+    }
+
+    let mut sync_stats = BlockOrderSyncStats::default();
+    let market_futs: Vec<_> = markets
+        .into_iter()
+        .map(|(spot_market, events)| {
+            let chain = chain.clone();
+            let query_account = query_account.to_string();
+            let store = store.clone();
+            let user_hub = user_hub.clone();
+            async move {
+                apply_market_order_events(
+                    &chain,
+                    &query_account,
+                    &store,
+                    &user_hub,
+                    block_num,
+                    &spot_market,
+                    events,
+                    opts,
+                )
+                .await
+            }
+        })
+        .collect();
+
+    for stats in join_all(market_futs).await {
+        sync_stats.created_total += stats.created_total;
+        sync_stats.created_yes += stats.created_yes;
+        sync_stats.created_no += stats.created_no;
+        sync_stats.created_unknown += stats.created_unknown;
+        sync_stats.skipped_duplicates += stats.skipped_duplicates;
     }
 
     if sync_stats.created_total > 0 || sync_stats.skipped_duplicates > 0 {
@@ -572,17 +380,341 @@ pub async fn process_block(
         );
     }
 
-    // One line per non-empty block so operators can see indexer progress without per-tx spam.
     if tx_count > 0 {
         tracing::info!(
             block_num,
-            digest = %block_digest,
             tx_count,
             ok_count,
             publish_ws = opts.publish_ws,
             "indexed block"
         );
     }
+}
+
+async fn apply_global_event(
+    chain: &SharedChainClient,
+    query_account: &str,
+    store: &SharedIndexState,
+    action_name: &str,
+    event: &TransactionEvent,
+) {
+    let EventData::Bytes(data) = &event.data else {
+        return;
+    };
+    match action_name {
+        "event_contract_created" => {
+            match bincode::deserialize::<EventContractCreatedEvent>(data) {
+                Ok(created) => {
+                    index_market_created(chain, query_account, store, created).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to decode event_contract_created");
+                }
+            }
+        }
+        "event_contract_resolved" => {
+            if let Ok(resolved) = bincode::deserialize::<EventContractResolvedEvent>(data) {
+                store
+                    .update_market_state(&resolved.market_address.to_string(), "Resolved")
+                    .await;
+            }
+        }
+        "vault_created" => match bincode::deserialize::<VaultCreatedEvent>(data) {
+            Ok(created) => {
+                index_vault_created(store, created).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode vault_created");
+            }
+        },
+        "vault_deposited" => {
+            if let Ok(deposited) = bincode::deserialize::<VaultDepositedEvent>(data) {
+                store
+                    .update_vault_equity(
+                        &deposited.vault.to_string(),
+                        &format_token_amount(deposited.equity),
+                    )
+                    .await;
+            }
+        }
+        "vault_withdrawn" => {
+            if let Ok(withdrawn) = bincode::deserialize::<VaultWithdrawnEvent>(data) {
+                store
+                    .update_vault_equity(
+                        &withdrawn.vault.to_string(),
+                        &format_token_amount(withdrawn.equity),
+                    )
+                    .await;
+            }
+        }
+        "vault_manager_updated" => {
+            if let Ok(updated) = bincode::deserialize::<VaultManagerUpdatedEvent>(data) {
+                store
+                    .update_vault_manager(
+                        &updated.vault.to_string(),
+                        &updated.new_manager.to_string(),
+                    )
+                    .await;
+            }
+        }
+        "vault_deposit_permission_updated" => {
+            if let Ok(updated) = bincode::deserialize::<VaultDepositPermissionUpdatedEvent>(data)
+            {
+                store
+                    .update_vault_allow_deposit(&updated.vault.to_string(), updated.allow_deposit)
+                    .await;
+            }
+        }
+        "vault_closed" => {
+            if let Ok(closed) = bincode::deserialize::<VaultClosedEvent>(data) {
+                store.mark_vault_closed(&closed.vault.to_string()).await;
+            }
+        }
+        "market_created" => match bincode::deserialize::<MarketCreatedEvent>(data) {
+            Ok(created) => {
+                index_spot_market_created(store, chain, query_account, created).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode market_created");
+            }
+        },
+        _ => {}
+    }
+}
+
+async fn apply_market_order_events(
+    chain: &SharedChainClient,
+    query_account: &str,
+    store: &SharedIndexState,
+    user_hub: &SharedUserEventHub,
+    block_num: u64,
+    spot_market: &str,
+    events: Vec<MarketOrderEvent>,
+    opts: ProcessOpts,
+) -> BlockOrderSyncStats {
+    let mut sync_stats = BlockOrderSyncStats::default();
+    for event in events {
+        match event {
+            MarketOrderEvent::Created(created) => {
+                let chain_order_id = created.order_id.to_string();
+                if store.has_chain_order(spot_market, &chain_order_id).await {
+                    sync_stats.skipped_duplicates += 1;
+                    tracing::warn!(
+                        block_num,
+                        order_id = chain_order_id,
+                        spot_market,
+                        "block_sync order_created skipped duplicate"
+                    );
+                    continue;
+                }
+                if opts.publish_ws {
+                    log_block_sync_order_created(
+                        &mut sync_stats,
+                        store,
+                        block_num,
+                        &created,
+                        spot_market,
+                    )
+                    .await;
+                } else {
+                    sync_stats.created_total += 1;
+                }
+                if let Err(error) = ensure_chain_hydrated(
+                    chain,
+                    store,
+                    query_account,
+                    spot_market,
+                    DEFAULT_BOOK_DEPTH,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        spot_market,
+                        error = %error,
+                        "failed to hydrate book before order_created"
+                    );
+                }
+                apply_order_created_to_book(
+                    store,
+                    block_num,
+                    &created,
+                    spot_market,
+                    opts.publish_ws,
+                )
+                .await;
+                index_order_created(store, created, spot_market, None).await;
+                if opts.publish_ws {
+                    publish_user_order_created(
+                        user_hub,
+                        store,
+                        spot_market,
+                        &chain_order_id,
+                        block_num,
+                    )
+                    .await;
+                }
+            }
+            MarketOrderEvent::Cancelled(cancelled) => {
+                let chain_order_id = cancelled.order_id.to_string();
+                store.books
+                    .apply_cancelled(
+                        spot_market,
+                        cancelled.side,
+                        cancelled.price,
+                        cancelled.cancelled_amount,
+                        block_num,
+                        opts.publish_ws,
+                    )
+                    .await;
+                store
+                    .update_order_cancelled(spot_market, &chain_order_id)
+                    .await;
+                if opts.publish_ws {
+                    publish_user_order_cancelled(
+                        user_hub,
+                        store,
+                        spot_market,
+                        &chain_order_id,
+                        block_num,
+                    )
+                    .await;
+                }
+            }
+            MarketOrderEvent::Updated(updated) => {
+                let chain_order_id = updated.order_id.to_string();
+                if let Err(error) = ensure_chain_hydrated(
+                    chain,
+                    store,
+                    query_account,
+                    spot_market,
+                    DEFAULT_BOOK_DEPTH,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        spot_market,
+                        error = %error,
+                        "failed to hydrate book before order_updated"
+                    );
+                }
+                store.books
+                    .apply_updated(
+                        spot_market,
+                        updated.side,
+                        updated.price,
+                        updated.old_amount,
+                        updated.new_amount,
+                        updated.remaining_amount,
+                        block_num,
+                        opts.publish_ws,
+                    )
+                    .await;
+                store
+                    .update_order_amount(
+                        spot_market,
+                        &chain_order_id,
+                        updated.new_amount,
+                        updated.remaining_amount,
+                    )
+                    .await;
+                if opts.publish_ws {
+                    publish_user_order_updated(
+                        user_hub,
+                        store,
+                        spot_market,
+                        &chain_order_id,
+                        block_num,
+                    )
+                    .await;
+                }
+            }
+            MarketOrderEvent::Filled { filled, tx_sender } => {
+                let chain_order_id = filled.order_id.to_string();
+                store
+                    .record_last_trade_price(spot_market, filled.price)
+                    .await;
+                if opts.publish_ws {
+                    if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
+                        store
+                            .bars
+                            .on_trade(
+                                spot_market,
+                                filled.price,
+                                filled.fill_amount,
+                                crate::bars::Bars::now_ts(),
+                            )
+                            .await;
+                    }
+                }
+                if let Err(error) = ensure_chain_hydrated(
+                    chain,
+                    store,
+                    query_account,
+                    spot_market,
+                    DEFAULT_BOOK_DEPTH,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        spot_market,
+                        error = %error,
+                        "failed to hydrate book before order_filled"
+                    );
+                }
+                store.books
+                    .apply_filled(
+                        spot_market,
+                        filled.side,
+                        filled.price,
+                        filled.fill_amount,
+                        block_num,
+                        filled.price,
+                        opts.publish_ws,
+                    )
+                    .await;
+                store
+                    .update_order_fill(
+                        spot_market,
+                        &chain_order_id,
+                        filled.fill_amount,
+                        filled.remaining_amount,
+                        filled.is_fully_filled,
+                    )
+                    .await;
+                if let Some((_, user_address, _)) = store
+                    .stored_order_by_chain_id(spot_market, &chain_order_id)
+                    .await
+                {
+                    store
+                        .apply_vault_fill_to_portfolio(
+                            &user_address,
+                            spot_market,
+                            filled.side,
+                            filled.fill_amount,
+                        )
+                        .await;
+                }
+                if opts.publish_ws {
+                    publish_user_order_filled(
+                        user_hub,
+                        store,
+                        &chain_order_id,
+                        spot_market,
+                        filled.price,
+                        filled.fill_amount,
+                        filled.remaining_amount,
+                        filled.is_fully_filled,
+                        filled.side,
+                        block_num,
+                        filled.cloid.clone(),
+                        tx_sender,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    sync_stats
 }
 
 fn log_tx_result(tx_result: &TransactionResult) {
@@ -832,7 +964,7 @@ fn format_event_detail(event: &TransactionEvent) -> String {
 
 async fn log_block_sync_order_created(
     stats: &mut BlockOrderSyncStats,
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     block_num: u64,
     created: &OrderCreatedEvent,
     spot_market: &str,
@@ -846,7 +978,13 @@ async fn log_block_sync_order_created(
             let slug = store
                 .get_market(market_id)
                 .await
-                .map(|market| market.slug);
+                .map(|market| {
+                    if !market.slug().is_empty() {
+                        market.slug().to_string()
+                    } else {
+                        market.name().to_string()
+                    }
+                });
             (outcome, slug)
         }
         None => ("unknown".into(), None),
@@ -881,8 +1019,7 @@ async fn log_block_sync_order_created(
 }
 
 pub async fn apply_order_created_to_book(
-    book_store: &SharedBookStore,
-    _store: &SharedIndexStore,
+    store: &SharedIndexState,
     block_num: u64,
     created: &OrderCreatedEvent,
     spot_market: &str,
@@ -892,7 +1029,8 @@ pub async fn apply_order_created_to_book(
         return;
     };
 
-    book_store
+    store
+        .books
         .apply_created(
             spot_market,
             created.side,
@@ -927,8 +1065,7 @@ fn warn_outcome_price_mismatch(outcome: &str, price_raw: u64, spot_market: &str,
 }
 
 async fn index_spot_market_created(
-    store: &SharedIndexStore,
-    book_store: &SharedBookStore,
+    store: &SharedIndexState,
     chain: &SharedChainClient,
     query_account: &str,
     created: MarketCreatedEvent,
@@ -943,13 +1080,12 @@ async fn index_spot_market_created(
     );
 
     store
-        .register_named_spot_market(&name, &spot_market)
+        .register_named_spot_market(&name, &spot_market, &created.creator.to_string())
         .await;
 
     if let Err(error) = ensure_chain_hydrated(
-        chain,
-        book_store,
-        store,
+                    chain,
+                    store,
         query_account,
         &spot_market,
         DEFAULT_BOOK_DEPTH,
@@ -968,8 +1104,7 @@ async fn index_spot_market_created(
 async fn index_market_created(
     chain: &SharedChainClient,
     query_account: &str,
-    store: &SharedIndexStore,
-    book_store: &SharedBookStore,
+    store: &SharedIndexState,
     created: EventContractCreatedEvent,
 ) {
     let market_address = created.market_address.to_string();
@@ -977,7 +1112,7 @@ async fn index_market_created(
     let slug = store.allocate_market_slug(&question).await;
     let icon_url = None;
 
-    let market = Market {
+    let market = Market::Event {
         id: market_uuid(&market_address),
         slug,
         question,
@@ -990,29 +1125,29 @@ async fn index_market_created(
         no_spot_market: created.no_spot_market.to_string(),
         state: created.state.to_string(),
         resolution_deadline: created.resolution_deadline,
+        deployer: created.creator.to_string(),
     };
 
     tracing::debug!(
-        market_id = %market.id,
-        slug = %market.slug,
-        question = %market.question,
-        market_address = %market.market_address,
+        market_id = %market.id(),
+        slug = %market.slug(),
+        question = %market.question(),
+        market_address = %market.market_address(),
         "indexed event contract market"
     );
 
     store.upsert_market(market.clone()).await;
     hydrate_market_spots(
         chain,
-        book_store,
         store,
         query_account,
-        &market.yes_spot_market,
-        &market.no_spot_market,
+        market.yes_spot_market(),
+        market.no_spot_market(),
     )
     .await;
 }
 
-async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEvent) {
+async fn index_vault_created(store: &SharedIndexState, created: VaultCreatedEvent) {
     let vault_address = created.vault.to_string();
     let trading_account = vault_account(created.vault);
     let vault = Vault {
@@ -1043,7 +1178,7 @@ async fn index_vault_created(store: &SharedIndexStore, created: VaultCreatedEven
 }
 
 pub async fn index_order_created(
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     created: OrderCreatedEvent,
     spot_market: &str,
     status_override: Option<(String, u64)>,
@@ -1073,7 +1208,14 @@ pub async fn index_order_created(
 
     let chain_order_id = created.order_id.to_string();
     let (question, market_slug) = match store.get_market(market_id).await {
-        Some(market) => (market.question, market.slug),
+        Some(market) => (
+            market.label().to_string(),
+            if !market.slug().is_empty() {
+                market.slug().to_string()
+            } else {
+                market.name().to_string()
+            },
+        ),
         None => (String::new(), String::new()),
     };
     let normalized_spot = crate::spot_market::normalize_spot_market_key(spot_market);
@@ -1117,7 +1259,7 @@ pub async fn index_order_created(
 
 pub async fn publish_user_order_created(
     user_hub: &SharedUserEventHub,
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     spot_market: &str,
     chain_order_id: &str,
     block_num: u64,
@@ -1141,7 +1283,7 @@ pub async fn publish_user_order_created(
 
 async fn publish_user_order_cancelled(
     user_hub: &SharedUserEventHub,
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     spot_market: &str,
     chain_order_id: &str,
     block_num: u64,
@@ -1165,7 +1307,7 @@ async fn publish_user_order_cancelled(
 
 async fn publish_user_order_updated(
     user_hub: &SharedUserEventHub,
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     spot_market: &str,
     chain_order_id: &str,
     block_num: u64,
@@ -1189,7 +1331,7 @@ async fn publish_user_order_updated(
 
 async fn publish_user_order_filled(
     user_hub: &SharedUserEventHub,
-    store: &SharedIndexStore,
+    store: &SharedIndexState,
     chain_order_id: &str,
     spot_market: &str,
     price_raw: u64,

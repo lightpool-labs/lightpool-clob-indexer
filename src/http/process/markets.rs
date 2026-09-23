@@ -5,7 +5,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::domain::{
-    MarketQuery, MarketSortOrder, DEFAULT_MARKETS_PAGE_LIMIT, MAX_MARKETS_ID_BATCH,
+    MarketCategory, MarketQuery, MarketSortOrder, DEFAULT_MARKETS_PAGE_LIMIT, MAX_MARKETS_ID_BATCH,
     MAX_MARKETS_PAGE_LIMIT, MAX_MARKETS_SLUG_BATCH,
 };
 use crate::error::{AppError, AppResult};
@@ -19,6 +19,8 @@ pub struct QueryMarketsParams {
     pub market_ids: Option<String>,
     pub market_addresses: Option<String>,
     pub state: Option<String>,
+    pub category: Option<String>,
+    pub deployer: Option<String>,
     pub order: Option<String>,
     pub ascending: Option<bool>,
 }
@@ -68,6 +70,15 @@ pub fn build_market_query(params: QueryMarketsParams) -> AppResult<MarketQuery> 
         )));
     }
 
+    let category = match params.category.as_deref() {
+        None => None,
+        Some(raw) => Some(MarketCategory::parse(raw).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "invalid category `{raw}`; use spot|event|perp"
+            ))
+        })?),
+    };
+
     let limit = params
         .limit
         .unwrap_or(DEFAULT_MARKETS_PAGE_LIMIT)
@@ -86,6 +97,11 @@ pub fn build_market_query(params: QueryMarketsParams) -> AppResult<MarketQuery> 
         market_addresses,
         state: params
             .state
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        category,
+        deployer: params
+            .deployer
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
         order: MarketSortOrder::parse(params.order.as_deref()),

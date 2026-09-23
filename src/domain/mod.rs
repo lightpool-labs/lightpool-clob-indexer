@@ -8,8 +8,8 @@ mod vault;
 
 pub use book::{BookLevel, BookSnapshot};
 pub use market::{
-    Market, MarketQuery, MarketSortOrder, DEFAULT_MARKETS_PAGE_LIMIT, MAX_MARKETS_ID_BATCH,
-    MAX_MARKETS_PAGE_LIMIT, MAX_MARKETS_SLUG_BATCH,
+    Market, MarketCategory, MarketQuery, MarketSortOrder, DEFAULT_MARKETS_PAGE_LIMIT,
+    MAX_MARKETS_ID_BATCH, MAX_MARKETS_PAGE_LIMIT, MAX_MARKETS_SLUG_BATCH,
 };
 pub use order::Order;
 pub use vault::{

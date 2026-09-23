@@ -18,7 +18,6 @@ pub async fn handle_subscribe(
 ) -> bool {
     if let Err(error) = rehydrate_spot_from_chain(
         &state.chain,
-        &state.book_store,
         &state.index,
         &state.config.query_account,
         spot_market,
@@ -32,14 +31,14 @@ pub async fn handle_subscribe(
         return true;
     }
 
-    if let Some(snapshot) = state.book_store.ws_quote_snapshot(spot_market).await {
+    if let Some(snapshot) = state.index.books.ws_quote_snapshot(spot_market).await {
         let text = serde_json::to_string(&snapshot).unwrap_or_default();
         if sender.send(Message::Text(text.into())).await.is_err() {
             return false;
         }
     }
 
-    let rx = state.book_store.subscribe_quote(spot_market).await;
+    let rx = state.index.books.subscribe_quote(spot_market).await;
     session.subscribe_quote(spot_market.to_string(), rx);
 
     let _ = sender

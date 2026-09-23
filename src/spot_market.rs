@@ -21,10 +21,18 @@ pub fn normalize_spot_market_key(value: &str) -> String {
     trimmed.to_string()
 }
 
-pub fn chain_order_key(spot_market: &str, chain_order_id: &str) -> String {
+/// Composite id for an on-chain order: `{normalized_spot_market}:{onchain_order_id}`.
+pub type OnchainOrderId = String;
+
+pub fn onchain_order_id(spot_market: &str, chain_order_id: &str) -> OnchainOrderId {
     format!(
         "{}:{}",
         normalize_spot_market_key(spot_market),
         chain_order_id
     )
+}
+
+/// Split `{spot}:{chain_order_id}` into `(spot, chain_order_id)`.
+pub fn split_onchain_order_id(id: &str) -> Option<(&str, &str)> {
+    id.rsplit_once(':')
 }

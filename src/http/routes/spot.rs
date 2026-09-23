@@ -59,7 +59,6 @@ async fn get_book(
 
     if let Err(error) = crate::book_hydrate::rehydrate_spot_from_chain(
         &state.chain,
-        &state.book_store,
         &state.index,
         &state.config.query_account,
         &spot_market,
@@ -75,7 +74,8 @@ async fn get_book(
     }
 
     let book = state
-        .book_store
+        .index
+        .books
         .snapshot(&spot_market, depth)
         .await
         .ok_or_else(|| AppError::NotFound(format!("order book for {spot_market} not found")))?;
@@ -113,28 +113,27 @@ async fn get_bars(
         .interval
         .as_deref()
         .unwrap_or(crate::bars::INTERVAL_1M);
-    match interval {
-        "1m" | "5m" | "15m" | "1h" | "4h" | "1d" => {}
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "unsupported interval `{other}`; use 1m|5m|15m|1h|4h|1d"
-            )));
-        }
+    if !crate::bars::is_supported_interval(interval) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported interval `{interval}`; use {}",
+            crate::bars::BAR_INTERVALS.join("|")
+        )));
     }
-    let limit = query.limit.unwrap_or(500).clamp(1, 5000);
+    let limit = query
+        .limit
+        .unwrap_or(500)
+        .clamp(1, crate::persist::BAR_HISTORY_LIMIT);
     let bars = state
-        .bar_store
+        .index
+        .bars
         .load_history(&spot_market, interval, query.from, query.to, limit)
         .await;
-    let forming = if interval == crate::bars::INTERVAL_1M {
-        state
-            .bar_store
-            .forming(&spot_market)
-            .await
-            .map(|b| b.to_ws_message("bar"))
-    } else {
-        None
-    };
+    let forming = state
+        .index
+        .bars
+        .forming_interval(&spot_market, interval)
+        .await
+        .map(|b| b.to_ws_message("bar"));
     Ok(Json(serde_json::json!({
         "spot_market": crate::spot_market::normalize_spot_market_key(&spot_market),
         "interval": interval,

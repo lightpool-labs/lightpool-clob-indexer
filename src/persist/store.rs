@@ -1,411 +1,24 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
-use lightpool_sdk::ReceiptBlock;
 use rusqlite::{params, Connection, OptionalExtension};
-use tokio::sync::mpsc;
 
 use crate::domain::{Market, Order, Vault};
 use crate::error::{AppError, AppResult};
-use crate::indexer::{SharedBookStore, SharedIndexStore};
-use crate::peer::encode_block_payload;
 use crate::spot_market::normalize_spot_market_key;
 
-#[derive(Debug, Clone)]
-pub struct ClosedBarRow {
-    pub spot_market: String,
-    pub interval: String,
-    pub start_ts: u64,
-    pub open_raw: u64,
-    pub high_raw: u64,
-    pub low_raw: u64,
-    pub close_raw: u64,
-    pub volume_raw: u64,
-    pub trade_count: u64,
-}
+use super::types::{
+    ClosedBarRow, PersistBookLevel, PersistBookMeta, PersistMeta, PersistOrderRow,
+    PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, ORDER_HISTORY_LIMIT,
+};
 
-#[derive(Clone)]
-pub struct SharedPersist {
-    inner: Arc<Mutex<PersistStore>>,
-    block_tx: mpsc::UnboundedSender<PersistBlockJob>,
-    pending_blocks: Arc<AtomicU64>,
-}
-
-struct PersistBlockJob {
-    block: ReceiptBlock,
-}
-
-struct PersistStore {
-    conn: Connection,
-}
-
-#[derive(Debug, Clone)]
-pub struct PersistMeta {
-    pub block_num: u64,
-    pub digest: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PersistOrderRow {
-    pub order: Order,
-    pub user_address: String,
-    pub chain_order_id: String,
-    pub spot_market: String,
-    pub size_raw: u64,
-    pub filled_raw: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PersistBookLevel {
-    pub spot_market: String,
-    pub side: String,
-    pub price_raw: u64,
-    pub size_raw: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PersistBookMeta {
-    pub spot_market: String,
-    pub sequence: u64,
-    pub last_trade_price: Option<u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PersistVaultPortfolioRow {
-    pub vault_id: String,
-    pub spot_market: String,
-    pub amount_raw: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CheckpointSnapshot {
-    pub block_num: u64,
-    pub digest: String,
-    pub markets: Vec<Market>,
-    pub orders: Vec<PersistOrderRow>,
-    pub last_trades: Vec<(String, u64)>,
-    pub book_levels: Vec<PersistBookLevel>,
-    pub book_metas: Vec<PersistBookMeta>,
-    #[serde(default)]
-    pub vaults: Vec<Vault>,
-    #[serde(default)]
-    pub vault_portfolio: Vec<PersistVaultPortfolioRow>,
-}
-
-impl SharedPersist {
-    pub fn open(path: impl AsRef<Path>) -> AppResult<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    AppError::Internal(format!("create sqlite dir {}: {e}", parent.display()))
-                })?;
-            }
-        }
-
-        let conn = Connection::open(path)
-            .map_err(|e| AppError::Internal(format!("open sqlite {}: {e}", path.display())))?;
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA foreign_keys = ON;
-            ",
-        )
-        .map_err(|e| AppError::Internal(format!("sqlite pragma: {e}")))?;
-
-        let store = PersistStore { conn };
-        store.migrate()?;
-        let inner = Arc::new(Mutex::new(store));
-        let pending_blocks = Arc::new(AtomicU64::new(0));
-        let block_tx = spawn_block_persist_worker(inner.clone(), pending_blocks.clone());
-        tracing::info!(path = %path.display(), "sqlite persist opened");
-        Ok(Self {
-            inner,
-            block_tx,
-            pending_blocks,
-        })
-    }
-
-    /// Queue a live block for background bincode serialize + sqlite write.
-    /// Does not block the indexer apply path on serialization or disk I/O.
-    pub fn enqueue_receipt_block(&self, block: ReceiptBlock) {
-        self.pending_blocks.fetch_add(1, Ordering::Relaxed);
-        if self.block_tx.send(PersistBlockJob { block }).is_err() {
-            self.pending_blocks.fetch_sub(1, Ordering::Relaxed);
-            tracing::error!("block persist worker stopped; dropping receipt block");
-        }
-    }
-
-    pub fn persist_pending(&self) -> u64 {
-        self.pending_blocks.load(Ordering::Relaxed)
-    }
-
-    pub fn meta(&self) -> AppResult<Option<PersistMeta>> {
-        self.with(|store| store.read_meta())
-    }
-
-    pub fn export_checkpoint_snapshot(&self) -> AppResult<Option<CheckpointSnapshot>> {
-        self.with(|store| {
-            let Some(meta) = store.read_meta()? else {
-                return Ok(None);
-            };
-            Ok(Some(CheckpointSnapshot {
-                block_num: meta.block_num,
-                digest: meta.digest,
-                markets: store.load_markets()?,
-                orders: store.load_orders()?,
-                last_trades: store.load_last_trades()?,
-                book_levels: store.load_book_levels()?,
-                book_metas: store.load_book_meta()?,
-                vaults: store.load_vaults()?,
-                vault_portfolio: store.load_vault_portfolio()?,
-            }))
-        })
-    }
-
-    pub fn save_block(&self, block_num: u64, digest: &str, payload: &[u8]) -> AppResult<()> {
-        self.with(|store| store.save_block(block_num, digest, payload))
-    }
-
-    pub fn load_blocks_after(
-        &self,
-        after_block_num: Option<u64>,
-    ) -> AppResult<Vec<(u64, String, Vec<u8>)>> {
-        self.with(|store| store.load_blocks_after(after_block_num, None))
-    }
-
-    pub fn load_blocks_after_limited(
-        &self,
-        after_block_num: Option<u64>,
-        limit: usize,
-    ) -> AppResult<Vec<(u64, String, Vec<u8>)>> {
-        self.with(|store| store.load_blocks_after(after_block_num, Some(limit)))
-    }
-
-    pub fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
-        self.with(|store| store.delete_blocks_after(after_block_num))
-    }
-
-    pub fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
-        self.with(|store| store.save_closed_bar(bar))
-    }
-
-    pub fn load_closed_bars(
-        &self,
-        spot_market: &str,
-        interval: &str,
-        from_ts: Option<u64>,
-        to_ts: Option<u64>,
-        limit: usize,
-    ) -> AppResult<Vec<ClosedBarRow>> {
-        self.with(|store| {
-            store.load_closed_bars(spot_market, interval, from_ts, to_ts, limit)
-        })
-    }
-
-    pub fn checkpoint_exported(
-        &self,
-        block_num: u64,
-        digest: &str,
-        markets: &[Market],
-        orders: &[PersistOrderRow],
-        last_trades: &[(String, u64)],
-        levels: &[PersistBookLevel],
-        metas: &[PersistBookMeta],
-        vaults: &[Vault],
-        vault_portfolio: &[PersistVaultPortfolioRow],
-    ) -> AppResult<()> {
-        self.with(|store| {
-            store.checkpoint(
-                block_num,
-                digest,
-                markets,
-                orders,
-                last_trades,
-                levels,
-                metas,
-                vaults,
-                vault_portfolio,
-            )
-        })
-    }
-
-    pub async fn load_into(
-        &self,
-        index: &SharedIndexStore,
-        book_store: &SharedBookStore,
-    ) -> AppResult<Option<PersistMeta>> {
-        let (meta, markets, orders, last_trades, levels, metas, vaults, vault_portfolio) =
-            self.with(|store| {
-                let meta = store.read_meta()?;
-                let markets = store.load_markets()?;
-                let orders = store.load_orders()?;
-                let last_trades = store.load_last_trades()?;
-                let levels = store.load_book_levels()?;
-                let metas = store.load_book_meta()?;
-                let vaults = store.load_vaults()?;
-                let vault_portfolio = store.load_vault_portfolio()?;
-                Ok((
-                    meta,
-                    markets,
-                    orders,
-                    last_trades,
-                    levels,
-                    metas,
-                    vaults,
-                    vault_portfolio,
-                ))
-            })?;
-
-        apply_snapshot_to_memory(
-            index,
-            book_store,
-            markets,
-            orders,
-            last_trades,
-            levels,
-            metas,
-            vaults,
-            vault_portfolio,
-        )
-        .await;
-
-        if let Some(ref meta) = meta {
-            tracing::info!(
-                block_num = meta.block_num,
-                digest = %meta.digest,
-                "recovered indexer state from sqlite"
-            );
-        } else {
-            tracing::info!("sqlite has no persisted indexer head yet");
-        }
-
-        Ok(meta)
-    }
-
-    pub async fn apply_checkpoint_snapshot(
-        &self,
-        snapshot: &CheckpointSnapshot,
-        index: &SharedIndexStore,
-        book_store: &SharedBookStore,
-    ) -> AppResult<()> {
-        index.clear_all().await;
-        apply_snapshot_to_memory(
-            index,
-            book_store,
-            snapshot.markets.clone(),
-            snapshot.orders.clone(),
-            snapshot.last_trades.clone(),
-            snapshot.book_levels.clone(),
-            snapshot.book_metas.clone(),
-            snapshot.vaults.clone(),
-            snapshot.vault_portfolio.clone(),
-        )
-        .await;
-
-        self.checkpoint_exported(
-            snapshot.block_num,
-            &snapshot.digest,
-            &snapshot.markets,
-            &snapshot.orders,
-            &snapshot.last_trades,
-            &snapshot.book_levels,
-            &snapshot.book_metas,
-            &snapshot.vaults,
-            &snapshot.vault_portfolio,
-        )?;
-        self.delete_blocks_after(snapshot.block_num)?;
-        Ok(())
-    }
-
-    fn with<T>(&self, f: impl FnOnce(&PersistStore) -> AppResult<T>) -> AppResult<T> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| AppError::Internal("sqlite mutex poisoned".into()))?;
-        f(&guard)
-    }
-}
-
-fn spawn_block_persist_worker(
-    inner: Arc<Mutex<PersistStore>>,
-    pending_blocks: Arc<AtomicU64>,
-) -> mpsc::UnboundedSender<PersistBlockJob> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<PersistBlockJob>();
-    tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
-            let inner = inner.clone();
-            let block_num = job.block.block_num;
-            let result = tokio::task::spawn_blocking(move || {
-                let digest = hex::encode(job.block.digest.as_bytes());
-                let payload = encode_block_payload(&job.block)?;
-                let guard = inner
-                    .lock()
-                    .map_err(|_| AppError::Internal("sqlite mutex poisoned".into()))?;
-                guard.save_block(block_num, &digest, &payload)
-            })
-            .await;
-            pending_blocks.fetch_sub(1, Ordering::Relaxed);
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::error!(block_num, error = %error, "async block persist failed");
-                }
-                Err(error) => {
-                    tracing::error!(block_num, error = %error, "async block persist task join failed");
-                }
-            }
-        }
-        tracing::info!("block persist worker stopped");
-    });
-    tx
-}
-
-async fn apply_snapshot_to_memory(
-    index: &SharedIndexStore,
-    book_store: &SharedBookStore,
-    markets: Vec<Market>,
-    orders: Vec<PersistOrderRow>,
-    last_trades: Vec<(String, u64)>,
-    levels: Vec<PersistBookLevel>,
-    metas: Vec<PersistBookMeta>,
-    vaults: Vec<Vault>,
-    vault_portfolio: Vec<PersistVaultPortfolioRow>,
-) {
-    for market in markets {
-        index.upsert_market(market).await;
-    }
-    for row in orders {
-        index
-            .insert_order(
-                row.order,
-                row.user_address,
-                &row.spot_market,
-                row.chain_order_id,
-                row.size_raw,
-                row.filled_raw,
-            )
-            .await;
-    }
-    for (spot, price) in last_trades {
-        index.record_last_trade_price(&spot, price).await;
-    }
-    book_store.import_from_persist(levels, metas).await;
-    for vault in vaults {
-        index.upsert_vault(vault).await;
-    }
-    index
-        .import_vault_portfolio_for_persist(vault_portfolio)
-        .await;
+pub(crate) struct PersistStore {
+    pub(crate) conn: Connection,
 }
 
 impl PersistStore {
-    fn migrate(&self) -> AppResult<()> {
+    pub(crate) fn migrate(&self) -> AppResult<()> {
         self.conn
             .execute_batch(
                 "
@@ -485,13 +98,27 @@ impl PersistStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_bars_spot_interval_ts
                     ON bars(spot_market, interval, start_ts);
+
+                CREATE TABLE IF NOT EXISTS order_history (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    user_address TEXT NOT NULL,
+                    chain_order_id TEXT NOT NULL,
+                    spot_market TEXT NOT NULL,
+                    size_raw INTEGER NOT NULL,
+                    filled_raw INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status_ts_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_order_history_user_ts
+                    ON order_history(user_address, status_ts_ms DESC);
                 ",
             )
             .map_err(|e| AppError::Internal(format!("sqlite migrate: {e}")))?;
         Ok(())
     }
 
-    fn read_meta(&self) -> AppResult<Option<PersistMeta>> {
+    pub(crate) fn read_meta(&self) -> AppResult<Option<PersistMeta>> {
         let block_num: Option<String> = self
             .conn
             .query_row(
@@ -518,7 +145,7 @@ impl PersistStore {
         Ok(Some(PersistMeta { block_num, digest }))
     }
 
-    fn save_block(&self, block_num: u64, digest: &str, payload: &[u8]) -> AppResult<()> {
+    pub(crate) fn save_block(&self, block_num: u64, digest: &str, payload: &[u8]) -> AppResult<()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -533,7 +160,7 @@ impl PersistStore {
         Ok(())
     }
 
-    fn load_blocks_after(
+    pub(crate) fn load_blocks_after(
         &self,
         after_block_num: Option<u64>,
         limit: Option<usize>,
@@ -586,7 +213,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
+    pub(crate) fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
         let deleted = self
             .conn
             .execute(
@@ -597,7 +224,7 @@ impl PersistStore {
         Ok(deleted)
     }
 
-    fn checkpoint(
+    pub(crate) fn checkpoint(
         &self,
         block_num: u64,
         digest: &str,
@@ -636,7 +263,7 @@ impl PersistStore {
             for market in markets {
                 let payload = serde_json::to_string(market)
                     .map_err(|e| AppError::Internal(format!("serialize market: {e}")))?;
-                stmt.execute(params![market.id.to_string(), payload])
+                stmt.execute(params![market.id().to_string(), payload])
                     .map_err(|e| AppError::Internal(format!("sqlite insert market: {e}")))?;
             }
         }
@@ -756,7 +383,7 @@ impl PersistStore {
         Ok(())
     }
 
-    fn load_markets(&self) -> AppResult<Vec<Market>> {
+    pub(crate) fn load_markets(&self) -> AppResult<Vec<Market>> {
         let mut stmt = self
             .conn
             .prepare("SELECT payload FROM markets")
@@ -771,14 +398,20 @@ impl PersistStore {
         for row in rows {
             let payload =
                 row.map_err(|e| AppError::Internal(format!("sqlite market row: {e}")))?;
-            let market: Market = serde_json::from_str(&payload)
-                .map_err(|e| AppError::Internal(format!("deserialize market: {e}")))?;
+            let value: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|e| AppError::Internal(format!("deserialize market json: {e}")))?;
+            let market = match serde_json::from_value::<Market>(value.clone()) {
+                Ok(market) => market,
+                Err(_) => Market::from_legacy_flat(value).ok_or_else(|| {
+                    AppError::Internal("deserialize market: unsupported payload".into())
+                })?,
+            };
             out.push(market);
         }
         Ok(out)
     }
 
-    fn load_orders(&self) -> AppResult<Vec<PersistOrderRow>> {
+    pub(crate) fn load_orders(&self) -> AppResult<Vec<PersistOrderRow>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -816,7 +449,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn load_last_trades(&self) -> AppResult<Vec<(String, u64)>> {
+    pub(crate) fn load_last_trades(&self) -> AppResult<Vec<(String, u64)>> {
         let mut stmt = self
             .conn
             .prepare("SELECT spot_market, price_raw FROM last_trades")
@@ -835,7 +468,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn load_book_levels(&self) -> AppResult<Vec<PersistBookLevel>> {
+    pub(crate) fn load_book_levels(&self) -> AppResult<Vec<PersistBookLevel>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -866,7 +499,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn load_book_meta(&self) -> AppResult<Vec<PersistBookMeta>> {
+    pub(crate) fn load_book_meta(&self) -> AppResult<Vec<PersistBookMeta>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -895,7 +528,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn load_vaults(&self) -> AppResult<Vec<Vault>> {
+    pub(crate) fn load_vaults(&self) -> AppResult<Vec<Vault>> {
         let mut stmt = self
             .conn
             .prepare("SELECT payload FROM vaults")
@@ -914,7 +547,7 @@ impl PersistStore {
         Ok(out)
     }
 
-    fn load_vault_portfolio(&self) -> AppResult<Vec<PersistVaultPortfolioRow>> {
+    pub(crate) fn load_vault_portfolio(&self) -> AppResult<Vec<PersistVaultPortfolioRow>> {
         let mut stmt = self
             .conn
             .prepare("SELECT vault_id, spot_market, amount_raw FROM vault_portfolio")
@@ -943,7 +576,7 @@ impl PersistStore {
 }
 
 impl PersistStore {
-    fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
+    pub(crate) fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO bars
@@ -965,7 +598,28 @@ impl PersistStore {
         Ok(())
     }
 
-    fn load_closed_bars(
+    pub(crate) fn trim_bars(&self, spot_market: &str, interval: &str, keep: usize) -> AppResult<()> {
+        let spot = normalize_spot_market_key(spot_market);
+        let keep = keep.max(1) as i64;
+        self.conn
+            .execute(
+                "DELETE FROM bars
+                 WHERE spot_market = ?1 AND interval = ?2
+                   AND start_ts < (
+                     SELECT MIN(start_ts) FROM (
+                       SELECT start_ts FROM bars
+                       WHERE spot_market = ?1 AND interval = ?2
+                       ORDER BY start_ts DESC
+                       LIMIT ?3
+                     )
+                   )",
+                params![spot, interval, keep],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite trim bars: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn load_closed_bars(
         &self,
         spot_market: &str,
         interval: &str,
@@ -976,7 +630,7 @@ impl PersistStore {
         let spot = normalize_spot_market_key(spot_market);
         let from = from_ts.unwrap_or(0) as i64;
         let to = to_ts.unwrap_or(i64::MAX as u64) as i64;
-        let limit = limit.max(1) as i64;
+        let limit = limit.max(1).min(BAR_HISTORY_LIMIT) as i64;
         let mut stmt = self
             .conn
             .prepare(
@@ -985,7 +639,7 @@ impl PersistStore {
                  FROM bars
                  WHERE spot_market = ?1 AND interval = ?2
                    AND start_ts >= ?3 AND start_ts <= ?4
-                 ORDER BY start_ts ASC
+                 ORDER BY start_ts DESC
                  LIMIT ?5",
             )
             .map_err(|e| AppError::Internal(format!("sqlite prepare bars: {e}")))?;
@@ -1008,10 +662,93 @@ impl PersistStore {
         for row in rows {
             out.push(row.map_err(|e| AppError::Internal(format!("sqlite bar row: {e}")))?);
         }
+        out.reverse();
         Ok(out)
     }
-}
 
-pub fn default_sqlite_path() -> PathBuf {
-    PathBuf::from("data/clob-index.sqlite3")
+    pub(crate) fn upsert_order_history(&self, row: &PersistOrderRow) -> AppResult<()> {
+        let payload = serde_json::to_string(&row.order)
+            .map_err(|e| AppError::Internal(format!("serialize order history: {e}")))?;
+        let user = row.user_address.trim().to_ascii_lowercase();
+        let spot = normalize_spot_market_key(&row.spot_market);
+        let status_ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO order_history
+                 (id, user_address, chain_order_id, spot_market, size_raw, filled_raw, status, payload, status_ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                   user_address = excluded.user_address,
+                   chain_order_id = excluded.chain_order_id,
+                   spot_market = excluded.spot_market,
+                   size_raw = excluded.size_raw,
+                   filled_raw = excluded.filled_raw,
+                   status = excluded.status,
+                   payload = excluded.payload,
+                   status_ts_ms = excluded.status_ts_ms",
+                params![
+                    row.order.id.to_string(),
+                    user,
+                    row.chain_order_id,
+                    spot,
+                    row.size_raw as i64,
+                    row.filled_raw as i64,
+                    row.order.status,
+                    payload,
+                    status_ts_ms,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite upsert order_history: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn list_order_history(
+        &self,
+        user_address: &str,
+        limit: usize,
+    ) -> AppResult<Vec<PersistOrderRow>> {
+        let user = user_address.trim().to_ascii_lowercase();
+        let limit = limit.max(1).min(ORDER_HISTORY_LIMIT) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT user_address, chain_order_id, spot_market, size_raw, filled_raw, payload
+                 FROM order_history
+                 WHERE user_address = ?1
+                 ORDER BY status_ts_ms DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite prepare order_history: {e}")))?;
+        let rows = stmt
+            .query_map(params![user, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| AppError::Internal(format!("sqlite query order_history: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (user_address, chain_order_id, spot_market, size_raw, filled_raw, payload) =
+                row.map_err(|e| AppError::Internal(format!("sqlite order_history row: {e}")))?;
+            let order: Order = serde_json::from_str(&payload)
+                .map_err(|e| AppError::Internal(format!("deserialize order history: {e}")))?;
+            out.push(PersistOrderRow {
+                order,
+                user_address,
+                chain_order_id,
+                spot_market,
+                size_raw: size_raw as u64,
+                filled_raw: filled_raw as u64,
+            });
+        }
+        Ok(out)
+    }
 }

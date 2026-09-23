@@ -15,6 +15,7 @@ use std::time::Duration;
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::error::{AppError, AppResult};
 use crate::mempool_client::MempoolClient;
@@ -36,24 +37,74 @@ pub struct SubmitQueue {
     mempool: MempoolClient,
 }
 
+/// Deferred ingress loop; start via [`SubmitQueueIngress::spawn`] from App workers.
+pub struct SubmitQueueIngress {
+    receiver: mpsc::Receiver<SubmitJob>,
+    mempool: MempoolClient,
+    submit_wait: SharedSubmitWaitRegistry,
+    wait_timeout: Duration,
+    capacity: usize,
+}
+
 impl SubmitQueue {
-    pub fn spawn(
+    pub fn create(
         mempool: MempoolClient,
         submit_wait: SharedSubmitWaitRegistry,
         config: SubmitQueueConfig,
-    ) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<SubmitJob>(config.capacity);
-        let wait_timeout = config.wait_timeout;
-        let mempool_for_ingress = mempool.clone();
+    ) -> (Self, SubmitQueueIngress) {
+        let (sender, receiver) = mpsc::channel::<SubmitJob>(config.capacity);
+        let queue = Self {
+            sender,
+            mempool: mempool.clone(),
+        };
+        let ingress = SubmitQueueIngress {
+            receiver,
+            mempool,
+            submit_wait,
+            wait_timeout: config.wait_timeout,
+            capacity: config.capacity,
+        };
+        (queue, ingress)
+    }
 
+    pub async fn submit(&self, tx: SignedTransaction) -> AppResult<SubmitTransactionResponse> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.sender
+            .send(SubmitJob { tx, respond_to })
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("submit queue unavailable".into()))?;
+
+        response_rx
+            .await
+            .map_err(|_| AppError::Internal("submit task dropped".into()))?
+    }
+
+    /// Push to mempool and return digest. Does not wait for block receipt.
+    pub async fn inject(&self, tx: SignedTransaction) -> AppResult<String> {
+        let digest = hex::encode(tx.digest().as_bytes());
+        self.mempool.submit_transaction(&tx).await?;
+        Ok(digest)
+    }
+}
+
+impl SubmitQueueIngress {
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        tracing::info!(
+            capacity = self.capacity,
+            wait_timeout_ms = self.wait_timeout.as_millis(),
+            "submit queue ingress starting"
+        );
+        let wait_timeout = self.wait_timeout;
+        let mempool = self.mempool;
+        let submit_wait = self.submit_wait;
         tokio::spawn(async move {
-            while let Some(job) = receiver.recv().await {
+            while let Some(job) = self.receiver.recv().await {
                 let digest_hex = hex::encode(job.tx.digest().as_bytes());
                 let receipt_rx = submit_wait.register(&digest_hex);
                 let sender_addr = job.tx.transaction().sender();
                 let respond_to = job.respond_to;
 
-                if let Err(error) = mempool_for_ingress.submit_transaction(&job.tx).await {
+                if let Err(error) = mempool.submit_transaction(&job.tx).await {
                     submit_wait.cancel(&digest_hex);
                     tracing::warn!(
                         digest = %digest_hex,
@@ -92,33 +143,7 @@ impl SubmitQueue {
             }
 
             tracing::info!("submit queue ingress stopped");
-        });
-
-        tracing::info!(
-            capacity = config.capacity,
-            wait_timeout_ms = wait_timeout.as_millis(),
-            "submit queue started (mempool ingress + per-tx receipt wait tasks)"
-        );
-        Self { sender, mempool }
-    }
-
-    pub async fn submit(&self, tx: SignedTransaction) -> AppResult<SubmitTransactionResponse> {
-        let (respond_to, response_rx) = oneshot::channel();
-        self.sender
-            .send(SubmitJob { tx, respond_to })
-            .await
-            .map_err(|_| AppError::ServiceUnavailable("submit queue unavailable".into()))?;
-
-        response_rx
-            .await
-            .map_err(|_| AppError::Internal("submit task dropped".into()))?
-    }
-
-    /// Push to mempool and return digest. Does not wait for block receipt.
-    pub async fn inject(&self, tx: SignedTransaction) -> AppResult<String> {
-        let digest = hex::encode(tx.digest().as_bytes());
-        self.mempool.submit_transaction(&tx).await?;
-        Ok(digest)
+        })
     }
 }
 

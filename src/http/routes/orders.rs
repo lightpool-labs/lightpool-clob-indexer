@@ -104,6 +104,8 @@ impl WireOrderCreatedEvent {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_orders))
+        .route("/openOrders", get(list_orders))
+        .route("/historicalOrders", get(list_historical_orders))
         .route("/query", get(query_order))
         .route("/:id/cancel-context", get(cancel_context))
         .route("/:id/cancelled", post(mark_cancelled))
@@ -140,31 +142,65 @@ async fn list_orders(
         .await;
 
     for record in &mut records {
-        if record.order.question.is_empty() || record.order.market_slug.is_empty() {
-            if let Some(market) = state.index.get_market(record.order.market_id).await {
-                if record.order.question.is_empty() {
-                    record.order.question = market.question;
-                }
-                if record.order.market_slug.is_empty() {
-                    record.order.market_slug = market.slug;
-                }
+        enrich_order_record(&state, record).await;
+    }
+
+    Json(records.into_iter().map(listed_from_record).collect())
+}
+
+async fn list_historical_orders(
+    State(state): State<AppState>,
+    Query(query): Query<ListOrdersQuery>,
+) -> AppResult<Json<Vec<ListedOrder>>> {
+    let Some(persist) = state.persist.as_ref() else {
+        return Ok(Json(Vec::new()));
+    };
+    let rows = persist.list_order_history(
+        &query.user_address,
+        crate::persist::ORDER_HISTORY_LIMIT,
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut record = crate::indexer::OrderQueryRecord {
+            order: row.order,
+            chain_order_id: row.chain_order_id,
+            spot_market: row.spot_market,
+            user_address: row.user_address,
+            size_raw: row.size_raw,
+            filled_raw: row.filled_raw,
+        };
+        enrich_order_record(&state, &mut record).await;
+        out.push(listed_from_record(record));
+    }
+    Ok(Json(out))
+}
+
+async fn enrich_order_record(state: &AppState, record: &mut crate::indexer::OrderQueryRecord) {
+    if record.order.question.is_empty() || record.order.market_slug.is_empty() {
+        if let Some(market) = state.index.get_market(record.order.market_id).await {
+            if record.order.question.is_empty() {
+                record.order.question = market.label().to_string();
+            }
+            if record.order.market_slug.is_empty() {
+                record.order.market_slug = if !market.slug().is_empty() {
+                    market.slug().to_string()
+                } else {
+                    market.name().to_string()
+                };
             }
         }
     }
+}
 
-    Json(
-        records
-            .into_iter()
-            .map(|record| ListedOrder {
-                order: record.order,
-                chain_order_id: record.chain_order_id,
-                spot_market: record.spot_market,
-                user_address: record.user_address,
-                size_raw: record.size_raw,
-                filled_raw: record.filled_raw,
-            })
-            .collect(),
-    )
+fn listed_from_record(record: crate::indexer::OrderQueryRecord) -> ListedOrder {
+    ListedOrder {
+        order: record.order,
+        chain_order_id: record.chain_order_id,
+        spot_market: record.spot_market,
+        user_address: record.user_address,
+        size_raw: record.size_raw,
+        filled_raw: record.filled_raw,
+    }
 }
 
 async fn query_order(
@@ -292,7 +328,6 @@ async fn index_from_event(
         .await;
     if is_new && !request.skip_book {
         apply_order_created_to_book(
-            &state.book_store,
             &state.index,
             0,
             &event,

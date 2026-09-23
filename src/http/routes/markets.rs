@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
-use crate::domain::Market;
+use crate::domain::{Market, MarketCategory};
 use crate::error::{AppError, AppResult};
 use crate::http::models::{BalanceTokenSpec, BookResponse, MarketsPageResponse};
 use crate::ws::models::RecentTrade;
@@ -19,15 +19,36 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(query_markets))
+        .route("/spot", get(query_spot_markets))
+        .route("/event", get(query_event_markets))
+        .route("/perp", get(query_perp_markets))
         .route("/slug/:slug", get(get_market_by_slug))
         .route("/index/position-token-specs", get(position_token_specs))
-        .route("/:symbol/book", get(get_book_by_symbol))
-        .route("/:symbol/trades", get(get_trades_by_symbol))
+        .route("/:name/book", get(get_book_by_name))
+        .route("/:name/trades", get(get_trades_by_name))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SpotBookQuery {
     pub depth: Option<u32>,
+}
+
+async fn query_markets_with_category(
+    state: AppState,
+    mut params: QueryMarketsParams,
+    category: MarketCategory,
+) -> AppResult<Json<MarketsPageResponse>> {
+    params.category = Some(category.as_str().to_string());
+    let query = build_market_query(params)?;
+    let limit = query.limit;
+    let offset = query.offset;
+    let (markets, total) = state.index.query_markets(query).await;
+    Ok(Json(MarketsPageResponse {
+        markets,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 async fn query_markets(
@@ -45,6 +66,27 @@ async fn query_markets(
         limit,
         offset,
     }))
+}
+
+async fn query_spot_markets(
+    State(state): State<AppState>,
+    Query(params): Query<QueryMarketsParams>,
+) -> AppResult<Json<MarketsPageResponse>> {
+    query_markets_with_category(state, params, MarketCategory::Spot).await
+}
+
+async fn query_event_markets(
+    State(state): State<AppState>,
+    Query(params): Query<QueryMarketsParams>,
+) -> AppResult<Json<MarketsPageResponse>> {
+    query_markets_with_category(state, params, MarketCategory::Event).await
+}
+
+async fn query_perp_markets(
+    State(state): State<AppState>,
+    Query(params): Query<QueryMarketsParams>,
+) -> AppResult<Json<MarketsPageResponse>> {
+    query_markets_with_category(state, params, MarketCategory::Perp).await
 }
 
 async fn get_market_by_slug(
@@ -71,17 +113,16 @@ async fn position_token_specs(
     )
 }
 
-async fn get_book_by_symbol(
+async fn get_book_by_name(
     State(state): State<AppState>,
-    Path(symbol): Path<String>,
+    Path(name): Path<String>,
     Query(query): Query<SpotBookQuery>,
 ) -> AppResult<Json<BookResponse>> {
     let depth = query.depth.unwrap_or(10).clamp(1, DEFAULT_BOOK_DEPTH);
-    let spot_market = resolve_spot_for_symbol(&state, &symbol).await?;
+    let spot_market = resolve_spot_for_name(&state, &name).await?;
 
     if let Err(error) = crate::book_hydrate::rehydrate_spot_from_chain(
         &state.chain,
-        &state.book_store,
         &state.index,
         &state.config.query_account,
         &spot_market,
@@ -97,7 +138,8 @@ async fn get_book_by_symbol(
     }
 
     let book = state
-        .book_store
+        .index
+        .books
         .snapshot(&spot_market, depth)
         .await
         .ok_or_else(|| AppError::NotFound(format!("order book for {spot_market} not found")))?;
@@ -105,24 +147,24 @@ async fn get_book_by_symbol(
     Ok(Json(book))
 }
 
-async fn get_trades_by_symbol(
+async fn get_trades_by_name(
     State(state): State<AppState>,
-    Path(symbol): Path<String>,
+    Path(name): Path<String>,
 ) -> AppResult<Json<Vec<RecentTrade>>> {
-    let spot_market = resolve_spot_for_symbol(&state, &symbol).await?;
-    Ok(Json(state.book_store.recent_trades(&spot_market).await))
+    let spot_market = resolve_spot_for_name(&state, &name).await?;
+    Ok(Json(state.index.books.recent_trades(&spot_market).await))
 }
 
-async fn resolve_spot_for_symbol(state: &AppState, symbol: &str) -> AppResult<String> {
-    if let Some(spot) = state.index.resolve_spot_market_key(symbol).await {
+async fn resolve_spot_for_name(state: &AppState, name: &str) -> AppResult<String> {
+    if let Some(spot) = state.index.resolve_spot_market_key(name).await {
         return Ok(spot);
     }
 
     // After indexer restart the in-memory name map is empty (not persisted). Discover
     // sequential spot markets on chain (0x0300…0001, …) and cache name → address.
-    let want = symbol.trim().to_ascii_uppercase();
+    let want = name.trim().to_ascii_uppercase();
     if want.is_empty() {
-        return Err(AppError::BadRequest("symbol is required".into()));
+        return Err(AppError::BadRequest("name is required".into()));
     }
 
     let account = crate::book_hydrate::parse_query_account(&state.config.query_account);
@@ -136,19 +178,18 @@ async fn resolve_spot_for_symbol(state: &AppState, symbol: &str) -> AppResult<St
             Ok(info) => info,
             Err(_) => break,
         };
-        let name = info.name.to_string();
+        let market_name = info.name.to_string();
         state
             .index
-            .register_named_spot_market(&name, &spot_key)
+            .register_named_spot_market(&market_name, &spot_key, "")
             .await;
 
-        let name_upper = name.to_ascii_uppercase();
-        if name_upper == want || name_upper.starts_with(&format!("{want}/")) {
+        if market_name.to_ascii_uppercase() == want {
             return Ok(spot_key);
         }
     }
 
     Err(AppError::NotFound(format!(
-        "spot market '{symbol}' not found; create the market (e.g. {want}/USDT) then retry"
+        "spot market '{name}' not found; create the market then retry"
     )))
 }
