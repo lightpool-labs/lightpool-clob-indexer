@@ -13,6 +13,8 @@ use tokio::sync::broadcast;
 
 use crate::chain::{format_price_pieces, format_token_amount};
 use crate::domain::{BookLevel, BookSnapshot};
+use crate::persist::index_state_tables::BookMetaRow;
+use crate::persist::index_write_set::IndexWriteSet;
 use crate::spot_market::normalize_spot_market_key;
 use crate::ws::models::{
     BookLevelDelta, OrderBookDelta, OrderBookSnapshot, QuoteDelta, QuoteSnapshot, RecentTrade,
@@ -109,10 +111,25 @@ impl Books {
         Vec<crate::persist::PersistBookLevel>,
         Vec<crate::persist::PersistBookMeta>,
     ) {
+        self.export_for_persist_spots(None).await
+    }
+
+    pub async fn export_for_persist_spots(
+        &self,
+        only_spots: Option<&[String]>,
+    ) -> (
+        Vec<crate::persist::PersistBookLevel>,
+        Vec<crate::persist::PersistBookMeta>,
+    ) {
         let mut levels = Vec::new();
         let mut metas = Vec::new();
         for entry in self.shards.iter() {
             let shard = entry.value();
+            if let Some(spots) = only_spots {
+                if !spots.iter().any(|s| s == &shard.spot_market) {
+                    continue;
+                }
+            }
             let Ok(book) = shard.book.lock() else {
                 continue;
             };
@@ -221,22 +238,48 @@ impl Books {
         spot_market: &str,
         chain_book: &GetOrderBook,
         last_trade_price: Option<u64>,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         let shard = self.shard(spot_market);
         let Ok(mut book) = shard.book.lock() else {
             return;
         };
 
+        if let Some(ws) = ws.as_deref_mut() {
+            for price in book.bids.keys().copied() {
+                ws.delete_book_level(&shard.spot_market, "buy", price as i64);
+            }
+            for price in book.asks.keys().copied() {
+                ws.delete_book_level(&shard.spot_market, "sell", price as i64);
+            }
+        }
+
         book.bids.clear();
         book.asks.clear();
         for level in &chain_book.best_bids {
             if level.total_quantity > 0 {
                 book.bids.insert(level.price, level.total_quantity);
+                if let Some(ws) = ws.as_deref_mut() {
+                    ws.store_book_level(
+                        &shard.spot_market,
+                        "buy",
+                        level.price as i64,
+                        level.total_quantity as i64,
+                    );
+                }
             }
         }
         for level in &chain_book.best_asks {
             if level.total_quantity > 0 {
                 book.asks.insert(level.price, level.total_quantity);
+                if let Some(ws) = ws.as_deref_mut() {
+                    ws.store_book_level(
+                        &shard.spot_market,
+                        "sell",
+                        level.price as i64,
+                        level.total_quantity as i64,
+                    );
+                }
             }
         }
         book.sequence = book.sequence.saturating_add(1);
@@ -244,6 +287,15 @@ impl Books {
             book.last_trade_price = Some(price);
         }
         book.chain_hydrated = true;
+        if let Some(ws) = ws {
+            ws.store_book_meta(
+                &shard.spot_market,
+                BookMetaRow {
+                    sequence: book.sequence as i64,
+                    last_trade_price: book.last_trade_price.map(|p| p as i64),
+                },
+            );
+        }
     }
 
     pub async fn apply_created(
@@ -254,6 +306,7 @@ impl Books {
         amount_raw: u64,
         block_num: u64,
         publish_ws: bool,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         if price_raw == 0 || amount_raw == 0 {
             return;
@@ -272,6 +325,7 @@ impl Books {
                 true,
                 block_num,
                 None,
+                ws,
             );
             let quote = delta.as_ref().map(|d| {
                 Self::quote_from_book(&shard.spot_market, d.block_num, &book)
@@ -291,6 +345,7 @@ impl Books {
         amount_raw: u64,
         block_num: u64,
         publish_ws: bool,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         if price_raw == 0 || amount_raw == 0 {
             return;
@@ -309,6 +364,7 @@ impl Books {
                 false,
                 block_num,
                 None,
+                ws,
             );
             let quote = delta.as_ref().map(|d| {
                 Self::quote_from_book(&shard.spot_market, d.block_num, &book)
@@ -330,6 +386,7 @@ impl Books {
         new_remaining_raw: u64,
         block_num: u64,
         publish_ws: bool,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         if price_raw == 0 {
             return;
@@ -356,6 +413,7 @@ impl Books {
                     true,
                     block_num,
                     None,
+                    ws,
                 )
             } else {
                 Self::apply_level_change(
@@ -367,6 +425,7 @@ impl Books {
                     false,
                     block_num,
                     None,
+                    ws,
                 )
             };
             let quote = delta.as_ref().map(|d| {
@@ -388,6 +447,7 @@ impl Books {
         block_num: u64,
         last_trade_price: u64,
         publish_ws: bool,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         if price_raw == 0 || fill_amount_raw == 0 {
             return;
@@ -406,6 +466,7 @@ impl Books {
                 false,
                 block_num,
                 Some(last_trade_price),
+                ws,
             );
             let fill_key = FillKey {
                 block_num,
@@ -494,10 +555,15 @@ impl Books {
         is_add: bool,
         block_num: u64,
         last_trade_price: Option<u64>,
+        mut ws: Option<&mut IndexWriteSet>,
     ) -> Option<OrderBookDelta> {
         let levels = match side {
             OrderSide::Buy => &mut book.bids,
             OrderSide::Sell => &mut book.asks,
+        };
+        let side_str = match side {
+            OrderSide::Buy => "buy",
+            OrderSide::Sell => "sell",
         };
 
         let current = levels.get(&price_raw).copied().unwrap_or(0);
@@ -509,12 +575,18 @@ impl Books {
 
         let level_delta = if next == 0 {
             levels.remove(&price_raw);
+            if let Some(ws) = ws.as_deref_mut() {
+                ws.delete_book_level(spot_market, side_str, price_raw as i64);
+            }
             BookLevelDelta {
                 price: format_price_pieces(price_raw),
                 size: "0".into(),
             }
         } else {
             levels.insert(price_raw, next);
+            if let Some(ws) = ws.as_deref_mut() {
+                ws.store_book_level(spot_market, side_str, price_raw as i64, next as i64);
+            }
             BookLevelDelta {
                 price: format_price_pieces(price_raw),
                 size: format_token_amount(next),
@@ -524,6 +596,15 @@ impl Books {
         book.sequence = book.sequence.saturating_add(1);
         if let Some(price) = last_trade_price {
             book.last_trade_price = Some(price);
+        }
+        if let Some(ws) = ws {
+            ws.store_book_meta(
+                spot_market,
+                BookMetaRow {
+                    sequence: book.sequence as i64,
+                    last_trade_price: book.last_trade_price.map(|p| p as i64),
+                },
+            );
         }
 
         let (bids, asks) = match side {

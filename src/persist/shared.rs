@@ -15,6 +15,7 @@ use crate::domain::{Market, Vault};
 use crate::error::{AppError, AppResult};
 use crate::indexer::SharedIndexState;
 
+use super::index_state_tables::IndexStateStore;
 use super::op::PersistOp;
 use super::store::{BlockStore, StateStore};
 use super::timing::{block_num_of, persist_timing, PersistOpKind, TimedPersistOp};
@@ -28,12 +29,27 @@ use super::workers::PersistWorkers;
 #[derive(Clone)]
 pub struct SharedPersist {
     blocks: Arc<Mutex<BlockStore>>,
+    /// Sqlite for order_history / bars only.
     state: Arc<Mutex<StateStore>>,
-    op_tx: mpsc::Sender<TimedPersistOp>,
-    ckpt_tx: mpsc::Sender<TimedPersistOp>,
+    /// RocksDB live index state (markets / orders / books / vaults).
+    index: Arc<IndexStateStore>,
+    /// Serializes RocksDB write + epoch clone (build may run without this gate).
+    index_write_gate: Arc<Mutex<()>>,
+    index_path: PathBuf,
+    /// None when receipt-block sqlite pipeline is disabled.
+    blocks_tx: Option<mpsc::Sender<TimedPersistOp>>,
+    history_tx: mpsc::Sender<TimedPersistOp>,
+    /// None when index-state WriteBatch pipeline is disabled.
+    index_write_tx: Option<mpsc::Sender<TimedPersistOp>>,
     pending: Arc<AtomicU64>,
     /// When false, order-history / bars enqueues are skipped (catch-up / quiet).
     secondary_enabled: Arc<AtomicBool>,
+    /// When false, skip epoch index-state clones (config off or catch-up).
+    epoch_ckpt_enabled: Arc<AtomicBool>,
+    /// Configured intent: epoch clones allowed when runtime flag is also true.
+    epoch_ckpt_configured: bool,
+    /// Epoch length in blocks; checkpoint at block_num 999, 1999, … when length is 1000.
+    epoch_length: u64,
 }
 
 fn open_sqlite_conn(path: &Path) -> AppResult<Connection> {
@@ -59,8 +75,8 @@ fn open_sqlite_conn(path: &Path) -> AppResult<Connection> {
     Ok(conn)
 }
 
-/// Derive `*-blocks.sqlite3` / `*-state.sqlite3` from `SQLITE_PATH` stem.
-pub fn split_sqlite_paths(base: &Path) -> (PathBuf, PathBuf) {
+/// Derive `*-blocks.sqlite3` / `*-state.sqlite3` / `*-index` from `SQLITE_PATH` stem.
+pub fn split_persist_paths(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
     let stem = base
         .file_stem()
@@ -73,14 +89,27 @@ pub fn split_sqlite_paths(base: &Path) -> (PathBuf, PathBuf) {
     (
         parent.join(format!("{stem}-blocks.{ext}")),
         parent.join(format!("{stem}-state.{ext}")),
+        parent.join(format!("{stem}-index")),
     )
 }
 
+#[deprecated(note = "use split_persist_paths")]
+pub fn split_sqlite_paths(base: &Path) -> (PathBuf, PathBuf) {
+    let (blocks, state, _) = split_persist_paths(base);
+    (blocks, state)
+}
+
 impl SharedPersist {
-    /// Open blocks + state sqlite files and return deferred persist pipeline.
-    pub fn open(path: impl AsRef<Path>) -> AppResult<(Self, PersistWorkers)> {
+    /// Open blocks/history sqlite + index-state rocksdb; return deferred persist pipeline.
+    pub fn open(
+        path: impl AsRef<Path>,
+        epoch_length: u64,
+        enable_blocks_persist: bool,
+        enable_index_state_persist: bool,
+        enable_epoch_checkpoint: bool,
+    ) -> AppResult<(Self, PersistWorkers)> {
         let base = path.as_ref();
-        let (blocks_path, state_path) = split_sqlite_paths(base);
+        let (blocks_path, state_path, index_path) = split_persist_paths(base);
 
         let blocks_conn = open_sqlite_conn(&blocks_path)?;
         let state_conn = open_sqlite_conn(&state_path)?;
@@ -88,40 +117,86 @@ impl SharedPersist {
         let state = StateStore { conn: state_conn };
         blocks.migrate()?;
         state.migrate()?;
+        let index = IndexStateStore::open(&index_path)?;
 
         let blocks = Arc::new(Mutex::new(blocks));
         let state = Arc::new(Mutex::new(state));
+        let index = Arc::new(index);
+        let index_write_gate = Arc::new(Mutex::new(()));
         let pending = Arc::new(AtomicU64::new(0));
         let secondary_enabled = Arc::new(AtomicBool::new(true));
-        let (op_tx, op_rx) = mpsc::channel::<TimedPersistOp>(DEFAULT_PERSIST_QUEUE_CAPACITY);
-        let (ckpt_tx, ckpt_rx) = mpsc::channel::<TimedPersistOp>(8);
+        let enable_epoch = enable_index_state_persist && enable_epoch_checkpoint;
+        let epoch_ckpt_enabled = Arc::new(AtomicBool::new(enable_epoch));
+        let (blocks_tx, blocks_rx) = if enable_blocks_persist {
+            let (tx, rx) = mpsc::channel::<TimedPersistOp>(DEFAULT_PERSIST_QUEUE_CAPACITY);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let (history_tx, history_rx) =
+            mpsc::channel::<TimedPersistOp>(DEFAULT_PERSIST_QUEUE_CAPACITY);
+        let (index_write_tx, index_state_write_rx) = if enable_index_state_persist {
+            let (tx, rx) = mpsc::channel::<TimedPersistOp>(32);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         tracing::info!(
             blocks = %blocks_path.display(),
-            state = %state_path.display(),
+            history = %state_path.display(),
+            index = %index_path.display(),
+            epoch_length,
+            enable_blocks_persist,
+            enable_index_state_persist,
+            enable_epoch_checkpoint = enable_epoch,
             queue_capacity = DEFAULT_PERSIST_QUEUE_CAPACITY,
-            "sqlite persist opened (blocks + state + checkpoint lane)"
+            "persist opened (sqlite history; optional blocks + rocksdb index-state)"
         );
         Ok((
             Self {
                 blocks: blocks.clone(),
                 state: state.clone(),
-                op_tx,
-                ckpt_tx,
+                index: index.clone(),
+                index_write_gate: index_write_gate.clone(),
+                index_path: index_path.clone(),
+                blocks_tx,
+                history_tx,
+                index_write_tx,
                 pending: pending.clone(),
                 secondary_enabled,
+                epoch_ckpt_enabled: epoch_ckpt_enabled.clone(),
+                epoch_ckpt_configured: enable_epoch,
+                epoch_length,
             },
             PersistWorkers {
                 blocks,
                 state,
+                index,
+                index_write_gate,
                 pending,
-                rx: op_rx,
-                ckpt_rx,
+                blocks_rx,
+                history_rx,
+                index_state_write_rx,
+                index_path,
+                epoch_length,
+                epoch_ckpt_enabled,
             },
         ))
     }
 
     pub fn set_secondary_persist(&self, enabled: bool) {
         self.secondary_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_epoch_checkpoint(&self, enabled: bool) {
+        self.epoch_ckpt_enabled.store(
+            self.epoch_ckpt_configured && enabled,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn epoch_checkpoint_configured(&self) -> bool {
+        self.epoch_ckpt_configured
     }
 
     pub fn secondary_persist_enabled(&self) -> bool {
@@ -133,13 +208,13 @@ impl SharedPersist {
             && self.pending.load(Ordering::Relaxed) <= SECONDARY_PENDING_LIMIT
     }
 
-    fn submit_nowait(&self, op: PersistOp) {
+    fn submit_nowait(&self, tx: &mpsc::Sender<TimedPersistOp>, op: PersistOp) {
         let kind = PersistOpKind::from_op(&op);
         let block_num = block_num_of(&op);
         let op_id = persist_timing().mark_enqueued(kind, block_num);
         self.pending.fetch_add(1, Ordering::Relaxed);
         let timed = TimedPersistOp { op_id, op };
-        match self.op_tx.try_send(timed) {
+        match tx.try_send(timed) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
@@ -153,32 +228,13 @@ impl SharedPersist {
         }
     }
 
-    fn submit_blocking(&self, op: PersistOp) {
+    async fn submit_async(&self, tx: &mpsc::Sender<TimedPersistOp>, op: PersistOp) {
         let kind = PersistOpKind::from_op(&op);
         let block_num = block_num_of(&op);
         let op_id = persist_timing().mark_enqueued(kind, block_num);
         self.pending.fetch_add(1, Ordering::Relaxed);
         let timed = TimedPersistOp { op_id, op };
-        let tx = self.op_tx.clone();
-        let result = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| tx.blocking_send(timed))
-        } else {
-            tx.blocking_send(timed)
-        };
-        if result.is_err() {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-            persist_timing().cancel(op_id);
-            tracing::error!("persist pipeline stopped; dropping persist op");
-        }
-    }
-
-    async fn submit_async(&self, op: PersistOp) {
-        let kind = PersistOpKind::from_op(&op);
-        let block_num = block_num_of(&op);
-        let op_id = persist_timing().mark_enqueued(kind, block_num);
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        let timed = TimedPersistOp { op_id, op };
-        if self.op_tx.send(timed).await.is_err() {
+        if tx.send(timed).await.is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             persist_timing().cancel(op_id);
             tracing::error!("persist pipeline stopped; dropping persist op");
@@ -187,7 +243,10 @@ impl SharedPersist {
 
     /// Clone the block into the ingress queue; encode workers bincode it later.
     pub async fn enqueue_receipt_block(&self, block: &ReceiptBlock) {
-        self.submit_async(PersistOp::SaveReceiptBlock(block.clone()))
+        let Some(tx) = self.blocks_tx.as_ref() else {
+            return;
+        };
+        self.submit_async(tx, PersistOp::SaveReceiptBlock(block.clone()))
             .await;
     }
 
@@ -195,55 +254,46 @@ impl SharedPersist {
         if !self.secondary_ok() {
             return;
         }
-        self.submit_nowait(PersistOp::UpsertOrderHistory(row));
+        self.submit_nowait(&self.history_tx, PersistOp::UpsertOrderHistory(row));
     }
 
     pub fn enqueue_closed_bar(&self, bar: ClosedBarRow) {
         if !self.secondary_ok() {
             return;
         }
-        self.submit_nowait(PersistOp::SaveClosedBar(bar));
+        self.submit_nowait(&self.history_tx, PersistOp::SaveClosedBar(bar));
     }
 
-    pub fn enqueue_checkpoint(
-        &self,
-        block_num: u64,
-        digest: String,
-        markets: Vec<Market>,
-        orders: Vec<PersistOrderRow>,
-        last_trades: Vec<(String, u64)>,
-        levels: Vec<PersistBookLevel>,
-        metas: Vec<PersistBookMeta>,
-        vaults: Vec<Vault>,
-        vault_portfolio: Vec<PersistVaultPortfolioRow>,
-    ) {
-        let op = PersistOp::Checkpoint {
-            block_num,
-            digest,
-            markets,
-            orders,
-            last_trades,
-            levels,
-            metas,
-            vaults,
-            vault_portfolio,
+    pub async fn enqueue_index_write(&self, ws: super::index_write_set::IndexWriteSet) {
+        let Some(tx) = self.index_write_tx.as_ref() else {
+            return;
         };
+        let op = PersistOp::IndexWrite(ws);
         let kind = PersistOpKind::from_op(&op);
         let block_num = block_num_of(&op);
         let op_id = persist_timing().mark_enqueued(kind, block_num);
         self.pending.fetch_add(1, Ordering::Relaxed);
         let timed = TimedPersistOp { op_id, op };
-        let tx = self.ckpt_tx.clone();
-        let result = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| tx.blocking_send(timed))
-        } else {
-            tx.blocking_send(timed)
-        };
-        if result.is_err() {
+        if tx.send(timed).await.is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
             persist_timing().cancel(op_id);
-            tracing::error!("checkpoint pipeline stopped; dropping checkpoint");
+            tracing::error!("index-write pipeline stopped; dropping IndexWriteSet");
         }
+    }
+
+    /// Epoch checkpoint: RocksDB Checkpoint of index-state only.
+    pub fn clone_epoch_checkpoint(&self, block_num: u64, digest: &str) -> AppResult<PathBuf> {
+        super::checkpoint::clone_index_state(
+            &self.index,
+            &self.index_write_gate,
+            &self.index_path,
+            block_num,
+            digest,
+        )
+    }
+
+    pub fn epoch_ckpt_path(&self, block_num: u64) -> PathBuf {
+        super::checkpoint::ckpt_path_for(&self.index_path, block_num)
     }
 
     pub fn persist_pending(&self) -> u64 {
@@ -263,11 +313,11 @@ impl SharedPersist {
     }
 
     pub fn meta(&self) -> AppResult<Option<PersistMeta>> {
-        self.with_state(|store| store.read_meta())
+        self.with_index(|store| store.read_meta())
     }
 
     pub fn export_checkpoint_snapshot(&self) -> AppResult<Option<CheckpointSnapshot>> {
-        self.with_state(|store| {
+        self.with_index(|store| {
             let Some(meta) = store.read_meta()? else {
                 return Ok(None);
             };
@@ -352,7 +402,7 @@ impl SharedPersist {
         vaults: &[Vault],
         vault_portfolio: &[PersistVaultPortfolioRow],
     ) -> AppResult<()> {
-        self.with_state(|store| {
+        self.with_index(|store| {
             store.checkpoint(
                 block_num,
                 digest,
@@ -376,7 +426,7 @@ impl SharedPersist {
         index: &SharedIndexState,
     ) -> AppResult<Option<PersistMeta>> {
         let (meta, markets, orders, last_trades, levels, metas, vaults, vault_portfolio) =
-            self.with_state(|store| {
+            self.with_index(|store| {
                 let meta = store.read_meta()?;
                 let markets = store.load_markets()?;
                 let orders = store.load_orders()?;
@@ -413,10 +463,10 @@ impl SharedPersist {
             tracing::info!(
                 block_num = meta.block_num,
                 digest = %meta.digest,
-                "recovered indexer state from sqlite"
+                "recovered indexer state from rocksdb"
             );
         } else {
-            tracing::info!("sqlite has no persisted indexer head yet");
+            tracing::info!("index-state rocksdb has no persisted indexer head yet");
         }
 
         Ok(meta)
@@ -471,6 +521,14 @@ impl SharedPersist {
             .map_err(|_| AppError::Internal("state sqlite mutex poisoned".into()))?;
         f(&guard)
     }
+
+    fn with_index<T>(&self, f: impl FnOnce(&IndexStateStore) -> AppResult<T>) -> AppResult<T> {
+        let _gate = self
+            .index_write_gate
+            .lock()
+            .map_err(|_| AppError::Internal("index-state write gate poisoned".into()))?;
+        f(&self.index)
+    }
 }
 
 async fn apply_snapshot_to_memory(
@@ -484,7 +542,7 @@ async fn apply_snapshot_to_memory(
     vault_portfolio: Vec<PersistVaultPortfolioRow>,
 ) {
     for market in markets {
-        index.upsert_market(market).await;
+        index.upsert_market(market, None).await;
     }
     for row in orders {
         index
@@ -495,15 +553,16 @@ async fn apply_snapshot_to_memory(
                 row.chain_order_id,
                 row.size_raw,
                 row.filled_raw,
+                None,
             )
             .await;
     }
     for (spot, price) in last_trades {
-        index.record_last_trade_price(&spot, price).await;
+        index.record_last_trade_price(&spot, price, None).await;
     }
     index.books.import_from_persist(levels, metas).await;
     for vault in vaults {
-        index.upsert_vault(vault).await;
+        index.upsert_vault(vault, None).await;
     }
     index
         .import_vault_portfolio_for_persist(vault_portfolio)

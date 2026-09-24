@@ -29,6 +29,7 @@ use crate::book_hydrate::{
 };
 use crate::chain::{format_price_pieces, format_token_amount};
 use crate::domain::{Market, Order, Vault};
+use crate::persist::IndexWriteSet;
 use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
 
@@ -50,15 +51,6 @@ async fn resolve_spot_market_for_order_event(
         return Some(spot_market);
     }
     store.lookup_spot_market_for_chain_order(chain_order_id).await
-}
-
-#[derive(Default)]
-struct BlockOrderSyncStats {
-    created_total: u32,
-    created_yes: u32,
-    created_no: u32,
-    created_unknown: u32,
-    skipped_duplicates: u32,
 }
 
 /// Options for block apply throughput vs live fan-out.
@@ -227,7 +219,7 @@ pub async fn process_block(
     opts: ProcessOpts,
 ) {
     let prepared = prepare_block(store, block).await;
-    process_prepared_block(
+    let _ = process_prepared_block(
         chain,
         query_account,
         store,
@@ -247,8 +239,10 @@ pub async fn process_prepared_block(
     submit_wait: &SharedSubmitWaitRegistry,
     prepared: PreparedBlock,
     opts: ProcessOpts,
-) {
+) -> IndexWriteSet {
     let block_num = prepared.block_num;
+    let digest = prepared.block_digest.clone();
+    let mut ws = IndexWriteSet::default();
     let tx_count = prepared.tx_count;
     let ok_count = prepared.ok_count;
     let markets = prepared.markets;
@@ -294,6 +288,7 @@ pub async fn process_prepared_block(
                 store,
                 action_name.as_str(),
                 event,
+                &mut ws,
             )
             .await;
         }
@@ -308,7 +303,7 @@ pub async fn process_prepared_block(
                 );
                 if opts.publish_ws {
                     if let Err(error) =
-                        hydrate_all_spot_markets(chain, store, query_account).await
+                        hydrate_all_spot_markets(chain, store, query_account, Some(&mut ws)).await
                     {
                         tracing::warn!(
                             error = %error,
@@ -324,7 +319,7 @@ pub async fn process_prepared_block(
                 );
                 if opts.publish_ws {
                     if let Err(error) =
-                        hydrate_all_spot_markets(chain, store, query_account).await
+                        hydrate_all_spot_markets(chain, store, query_account, Some(&mut ws)).await
                     {
                         tracing::warn!(
                             error = %error,
@@ -336,7 +331,6 @@ pub async fn process_prepared_block(
         }
     }
 
-    let mut sync_stats = BlockOrderSyncStats::default();
     let market_futs: Vec<_> = markets
         .into_iter()
         .map(|(spot_market, events)| {
@@ -360,24 +354,8 @@ pub async fn process_prepared_block(
         })
         .collect();
 
-    for stats in join_all(market_futs).await {
-        sync_stats.created_total += stats.created_total;
-        sync_stats.created_yes += stats.created_yes;
-        sync_stats.created_no += stats.created_no;
-        sync_stats.created_unknown += stats.created_unknown;
-        sync_stats.skipped_duplicates += stats.skipped_duplicates;
-    }
-
-    if sync_stats.created_total > 0 || sync_stats.skipped_duplicates > 0 {
-        tracing::debug!(
-            block_num,
-            created_total = sync_stats.created_total,
-            created_yes = sync_stats.created_yes,
-            created_no = sync_stats.created_no,
-            created_unknown = sync_stats.created_unknown,
-            skipped_duplicates = sync_stats.skipped_duplicates,
-            "block_sync order_created summary"
-        );
+    for set in join_all(market_futs).await {
+        ws.merge(set);
     }
 
     if tx_count > 0 {
@@ -389,6 +367,10 @@ pub async fn process_prepared_block(
             "indexed block"
         );
     }
+
+    ws.block_num = block_num;
+    ws.digest = digest;
+    ws
 }
 
 async fn apply_global_event(
@@ -397,6 +379,7 @@ async fn apply_global_event(
     store: &SharedIndexState,
     action_name: &str,
     event: &TransactionEvent,
+    ws: &mut IndexWriteSet,
 ) {
     let EventData::Bytes(data) = &event.data else {
         return;
@@ -405,7 +388,7 @@ async fn apply_global_event(
         "event_contract_created" => {
             match bincode::deserialize::<EventContractCreatedEvent>(data) {
                 Ok(created) => {
-                    index_market_created(chain, query_account, store, created).await;
+                    index_market_created(chain, query_account, store, created, ws).await;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to decode event_contract_created");
@@ -415,13 +398,17 @@ async fn apply_global_event(
         "event_contract_resolved" => {
             if let Ok(resolved) = bincode::deserialize::<EventContractResolvedEvent>(data) {
                 store
-                    .update_market_state(&resolved.market_address.to_string(), "Resolved")
+                    .update_market_state(
+                        &resolved.market_address.to_string(),
+                        "Resolved",
+                        Some(ws),
+                    )
                     .await;
             }
         }
         "vault_created" => match bincode::deserialize::<VaultCreatedEvent>(data) {
             Ok(created) => {
-                index_vault_created(store, created).await;
+                index_vault_created(store, created, ws).await;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode vault_created");
@@ -433,6 +420,7 @@ async fn apply_global_event(
                     .update_vault_equity(
                         &deposited.vault.to_string(),
                         &format_token_amount(deposited.equity),
+                        Some(ws),
                     )
                     .await;
             }
@@ -443,6 +431,7 @@ async fn apply_global_event(
                     .update_vault_equity(
                         &withdrawn.vault.to_string(),
                         &format_token_amount(withdrawn.equity),
+                        Some(ws),
                     )
                     .await;
             }
@@ -453,6 +442,7 @@ async fn apply_global_event(
                     .update_vault_manager(
                         &updated.vault.to_string(),
                         &updated.new_manager.to_string(),
+                        Some(ws),
                     )
                     .await;
             }
@@ -461,18 +451,24 @@ async fn apply_global_event(
             if let Ok(updated) = bincode::deserialize::<VaultDepositPermissionUpdatedEvent>(data)
             {
                 store
-                    .update_vault_allow_deposit(&updated.vault.to_string(), updated.allow_deposit)
+                    .update_vault_allow_deposit(
+                        &updated.vault.to_string(),
+                        updated.allow_deposit,
+                        Some(ws),
+                    )
                     .await;
             }
         }
         "vault_closed" => {
             if let Ok(closed) = bincode::deserialize::<VaultClosedEvent>(data) {
-                store.mark_vault_closed(&closed.vault.to_string()).await;
+                store
+                    .mark_vault_closed(&closed.vault.to_string(), Some(ws))
+                    .await;
             }
         }
         "market_created" => match bincode::deserialize::<MarketCreatedEvent>(data) {
             Ok(created) => {
-                index_spot_market_created(store, chain, query_account, created).await;
+                index_spot_market_created(store, chain, query_account, created, ws).await;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode market_created");
@@ -491,14 +487,13 @@ async fn apply_market_order_events(
     spot_market: &str,
     events: Vec<MarketOrderEvent>,
     opts: ProcessOpts,
-) -> BlockOrderSyncStats {
-    let mut sync_stats = BlockOrderSyncStats::default();
+) -> IndexWriteSet {
+    let mut ws = IndexWriteSet::default();
     for event in events {
         match event {
             MarketOrderEvent::Created(created) => {
                 let chain_order_id = created.order_id.to_string();
                 if store.has_chain_order(spot_market, &chain_order_id).await {
-                    sync_stats.skipped_duplicates += 1;
                     tracing::warn!(
                         block_num,
                         order_id = chain_order_id,
@@ -508,16 +503,7 @@ async fn apply_market_order_events(
                     continue;
                 }
                 if opts.publish_ws {
-                    log_block_sync_order_created(
-                        &mut sync_stats,
-                        store,
-                        block_num,
-                        &created,
-                        spot_market,
-                    )
-                    .await;
-                } else {
-                    sync_stats.created_total += 1;
+                    maybe_warn_order_created_price(store, &created, spot_market).await;
                 }
                 if let Err(error) = ensure_chain_hydrated(
                     chain,
@@ -525,6 +511,7 @@ async fn apply_market_order_events(
                     query_account,
                     spot_market,
                     DEFAULT_BOOK_DEPTH,
+                    Some(&mut ws),
                 )
                 .await
                 {
@@ -540,9 +527,10 @@ async fn apply_market_order_events(
                     &created,
                     spot_market,
                     opts.publish_ws,
+                    Some(&mut ws),
                 )
                 .await;
-                index_order_created(store, created, spot_market, None).await;
+                index_order_created(store, created, spot_market, None, Some(&mut ws)).await;
                 if opts.publish_ws {
                     publish_user_order_created(
                         user_hub,
@@ -564,10 +552,11 @@ async fn apply_market_order_events(
                         cancelled.cancelled_amount,
                         block_num,
                         opts.publish_ws,
+                        Some(&mut ws),
                     )
                     .await;
                 store
-                    .update_order_cancelled(spot_market, &chain_order_id)
+                    .update_order_cancelled(spot_market, &chain_order_id, Some(&mut ws))
                     .await;
                 if opts.publish_ws {
                     publish_user_order_cancelled(
@@ -588,6 +577,7 @@ async fn apply_market_order_events(
                     query_account,
                     spot_market,
                     DEFAULT_BOOK_DEPTH,
+                    Some(&mut ws),
                 )
                 .await
                 {
@@ -607,6 +597,7 @@ async fn apply_market_order_events(
                         updated.remaining_amount,
                         block_num,
                         opts.publish_ws,
+                        Some(&mut ws),
                     )
                     .await;
                 store
@@ -615,6 +606,7 @@ async fn apply_market_order_events(
                         &chain_order_id,
                         updated.new_amount,
                         updated.remaining_amount,
+                        Some(&mut ws),
                     )
                     .await;
                 if opts.publish_ws {
@@ -631,7 +623,7 @@ async fn apply_market_order_events(
             MarketOrderEvent::Filled { filled, tx_sender } => {
                 let chain_order_id = filled.order_id.to_string();
                 store
-                    .record_last_trade_price(spot_market, filled.price)
+                    .record_last_trade_price(spot_market, filled.price, Some(&mut ws))
                     .await;
                 if opts.publish_ws {
                     if matches!(filled.side, lightpool_sdk::OrderSide::Buy) {
@@ -652,6 +644,7 @@ async fn apply_market_order_events(
                     query_account,
                     spot_market,
                     DEFAULT_BOOK_DEPTH,
+                    Some(&mut ws),
                 )
                 .await
                 {
@@ -670,6 +663,7 @@ async fn apply_market_order_events(
                         block_num,
                         filled.price,
                         opts.publish_ws,
+                        Some(&mut ws),
                     )
                     .await;
                 store
@@ -679,6 +673,7 @@ async fn apply_market_order_events(
                         filled.fill_amount,
                         filled.remaining_amount,
                         filled.is_fully_filled,
+                        Some(&mut ws),
                     )
                     .await;
                 if let Some((_, user_address, _)) = store
@@ -691,6 +686,7 @@ async fn apply_market_order_events(
                             spot_market,
                             filled.side,
                             filled.fill_amount,
+                            Some(&mut ws),
                         )
                         .await;
                 }
@@ -714,7 +710,7 @@ async fn apply_market_order_events(
             }
         }
     }
-    sync_stats
+    ws
 }
 
 fn log_tx_result(tx_result: &TransactionResult) {
@@ -962,10 +958,8 @@ fn format_event_detail(event: &TransactionEvent) -> String {
     format!("{action}: (undecoded)")
 }
 
-async fn log_block_sync_order_created(
-    stats: &mut BlockOrderSyncStats,
+async fn maybe_warn_order_created_price(
     store: &SharedIndexState,
-    block_num: u64,
     created: &OrderCreatedEvent,
     spot_market: &str,
 ) {
@@ -973,47 +967,10 @@ async fn log_block_sync_order_created(
         return;
     };
 
-    let (outcome, slug) = match store.lookup_spot_market(spot_market).await {
-        Some((market_id, outcome)) => {
-            let slug = store
-                .get_market(market_id)
-                .await
-                .map(|market| {
-                    if !market.slug().is_empty() {
-                        market.slug().to_string()
-                    } else {
-                        market.name().to_string()
-                    }
-                });
-            (outcome, slug)
-        }
-        None => ("unknown".into(), None),
+    let outcome = match store.lookup_spot_market(spot_market).await {
+        Some((_, outcome)) => outcome,
+        None => "unknown".into(),
     };
-
-    match outcome.as_str() {
-        "yes" => stats.created_yes += 1,
-        "no" => stats.created_no += 1,
-        _ => stats.created_unknown += 1,
-    }
-    stats.created_total += 1;
-
-    let side = match created.side {
-        lightpool_sdk::OrderSide::Buy => "buy",
-        lightpool_sdk::OrderSide::Sell => "sell",
-    };
-
-    tracing::debug!(
-        block_num,
-        order_id = %created.order_id,
-        slug = slug.as_deref().unwrap_or("-"),
-        outcome,
-        spot_market,
-        side,
-        price = %format_price_pieces(*price),
-        quantity = %format_token_amount(created.amount),
-        creator = %created.creator,
-        "block_sync order_created"
-    );
 
     warn_outcome_price_mismatch(&outcome, *price, spot_market, &created.order_id.to_string());
 }
@@ -1024,6 +981,7 @@ pub async fn apply_order_created_to_book(
     created: &OrderCreatedEvent,
     spot_market: &str,
     publish_ws: bool,
+    mut ws: Option<&mut IndexWriteSet>,
 ) {
     let OrderEventType::Limit { price, .. } = &created.order_type else {
         return;
@@ -1038,6 +996,7 @@ pub async fn apply_order_created_to_book(
             created.amount,
             block_num,
             publish_ws,
+            ws,
         )
         .await;
 }
@@ -1069,6 +1028,7 @@ async fn index_spot_market_created(
     chain: &SharedChainClient,
     query_account: &str,
     created: MarketCreatedEvent,
+    ws: &mut IndexWriteSet,
 ) {
     let spot_market = created.market_address.to_string();
     let name = created.name.to_string();
@@ -1084,11 +1044,12 @@ async fn index_spot_market_created(
         .await;
 
     if let Err(error) = ensure_chain_hydrated(
-                    chain,
-                    store,
+        chain,
+        store,
         query_account,
         &spot_market,
         DEFAULT_BOOK_DEPTH,
+        Some(ws),
     )
     .await
     {
@@ -1106,6 +1067,7 @@ async fn index_market_created(
     query_account: &str,
     store: &SharedIndexState,
     created: EventContractCreatedEvent,
+    ws: &mut IndexWriteSet,
 ) {
     let market_address = created.market_address.to_string();
     let question = created.question.clone();
@@ -1136,18 +1098,23 @@ async fn index_market_created(
         "indexed event contract market"
     );
 
-    store.upsert_market(market.clone()).await;
+    store.upsert_market(market.clone(), Some(ws)).await;
     hydrate_market_spots(
         chain,
         store,
         query_account,
         market.yes_spot_market(),
         market.no_spot_market(),
+        Some(ws),
     )
     .await;
 }
 
-async fn index_vault_created(store: &SharedIndexState, created: VaultCreatedEvent) {
+async fn index_vault_created(
+    store: &SharedIndexState,
+    created: VaultCreatedEvent,
+    ws: &mut IndexWriteSet,
+) {
     let vault_address = created.vault.to_string();
     let trading_account = vault_account(created.vault);
     let vault = Vault {
@@ -1174,7 +1141,7 @@ async fn index_vault_created(store: &SharedIndexState, created: VaultCreatedEven
         "indexed vault"
     );
 
-    store.upsert_vault(vault).await;
+    store.upsert_vault(vault, Some(ws)).await;
 }
 
 pub async fn index_order_created(
@@ -1182,6 +1149,7 @@ pub async fn index_order_created(
     created: OrderCreatedEvent,
     spot_market: &str,
     status_override: Option<(String, u64)>,
+    mut ws: Option<&mut IndexWriteSet>,
 ) -> Option<Order> {
     let (market_id, outcome) = match store.lookup_spot_market(spot_market).await {
         Some(mapped) => mapped,
@@ -1251,6 +1219,7 @@ pub async fn index_order_created(
             chain_order_id,
             created.amount,
             filled_raw,
+            ws,
         )
         .await;
 

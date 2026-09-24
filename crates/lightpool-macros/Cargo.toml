@@ -1,0 +1,17 @@
+[package]
+name = "lightpool-macros"
+version = "0.1.0"
+authors = ["xiaoyu1998 (with AI assistance)"]
+edition = "2021"
+
+[dependencies]
+paste = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+once_cell = { workspace = true }
+
+[features]
+fail_points = []
+
+[lib]
+proc-macro = false 

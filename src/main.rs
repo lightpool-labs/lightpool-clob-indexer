@@ -30,10 +30,20 @@ use crate::config::Config;
 #[derive(Debug, Parser)]
 #[command(name = "lightpool-clob-indexer", about = "LightPool CLOB indexer")]
 struct Cli {
-    /// Disable sqlite persistence (no recover/checkpoint/block/bar/order-history writes).
-    /// Equivalent to ENABLE_SQLITE=false or DISABLE_PERSIST=true.
+    /// Disable sqlite persistence (history + optional blocks). Equivalent to
+    /// ENABLE_SQLITE=false or DISABLE_PERSIST=true.
     #[arg(long, default_value_t = false)]
     no_persist: bool,
+
+    /// Enable receipt-block sqlite writes. Off by default (history still persists).
+    /// Equivalent to PERSIST_BLOCKS=true.
+    #[arg(long, default_value_t = false)]
+    persist_blocks: bool,
+
+    /// Enable RocksDB index-state writes and epoch checkpoint clones (`ckpt--N`).
+    /// Off by default. Equivalent to PERSIST_CHECKPOINT=true.
+    #[arg(long, default_value_t = false)]
+    persist_checkpoint: bool,
 }
 
 #[tokio::main]
@@ -48,9 +58,22 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    let config = Config::from_env_with_overrides(cli.no_persist);
+    let config = Config::from_env_with_overrides(
+        cli.no_persist,
+        cli.persist_blocks,
+        cli.persist_checkpoint,
+    );
     if !config.enable_sqlite {
         tracing::info!("sqlite persistence disabled");
+    } else {
+        tracing::info!(
+            blocks = config.enable_blocks_persist,
+            history = true,
+            index_state = config.enable_index_state_persist,
+            epoch_checkpoint = config.enable_epoch_checkpoint,
+            epoch_length = config.checkpoint_every_blocks,
+            "persist config"
+        );
     }
 
     let mut app = App::build(config);

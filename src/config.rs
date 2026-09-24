@@ -26,9 +26,15 @@ pub struct Config {
     pub submit_queue_capacity: usize,
     pub submit_wait_timeout_ms: u64,
     pub sqlite_path: PathBuf,
-    /// When false, skip sqlite open/recover/checkpoint/block/bar/order-history writes.
+    /// When false, skip sqlite open/recover/history writes.
     pub enable_sqlite: bool,
-    /// Persist a sqlite checkpoint after this many applied receipt blocks.
+    /// When true, persist receipt blocks to sqlite. Off by default.
+    pub enable_blocks_persist: bool,
+    /// When true, run RocksDB index-state WriteBatch pipeline. Off by default.
+    pub enable_index_state_persist: bool,
+    /// When true, clone index-state RocksDB at epoch ends (`ckpt--999`, …). Off by default.
+    pub enable_epoch_checkpoint: bool,
+    /// Epoch length in receipt blocks; used only when `enable_epoch_checkpoint` is true.
     pub checkpoint_every_blocks: u64,
     /// Peer clob-index base URLs (e.g. http://127.0.0.1:3003) for historic catch-up.
     pub peer_index_urls: Vec<String>,
@@ -38,14 +44,22 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        Self::from_env_with_overrides(false)
+        Self::from_env_with_overrides(false, false, false)
     }
 
-    /// `no_persist` forces sqlite persistence off (CLI `--no-persist`).
-    pub fn from_env_with_overrides(no_persist: bool) -> Self {
+    /// CLI overrides for persist toggles.
+    pub fn from_env_with_overrides(
+        no_persist: bool,
+        persist_blocks: bool,
+        persist_checkpoint: bool,
+    ) -> Self {
         let enable_sqlite = env_flag("ENABLE_SQLITE", true)
             && !env_flag("DISABLE_PERSIST", false)
             && !no_persist;
+        let want_blocks = persist_blocks || env_flag("PERSIST_BLOCKS", false);
+        let want_checkpoint = persist_checkpoint
+            || env_flag("PERSIST_CHECKPOINT", false)
+            || env_flag("ENABLE_EPOCH_CHECKPOINT", false);
 
         Self {
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
@@ -74,6 +88,9 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| crate::persist::default_sqlite_path()),
             enable_sqlite,
+            enable_blocks_persist: enable_sqlite && want_blocks,
+            enable_index_state_persist: enable_sqlite && want_checkpoint,
+            enable_epoch_checkpoint: enable_sqlite && want_checkpoint,
             checkpoint_every_blocks: env::var("CHECKPOINT_EVERY_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())

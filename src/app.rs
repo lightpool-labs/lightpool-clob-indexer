@@ -126,64 +126,24 @@ impl App {
             })
         };
 
-        if let (Some(persist), Some(apply_gate)) =
-            (self.state.persist.clone(), self.apply_gate.clone())
-        {
-            let (ckpt_notify, ckpt_rx) =
-                indexer::new_checkpoint_channel(config.checkpoint_every_blocks);
-            self.background.push(
-                "checkpoint",
-                indexer::spawn_checkpoint_worker(
-                    ckpt_rx,
-                    ckpt_notify.clone(),
-                    persist,
-                    self.state.indexed_head.clone(),
-                    self.state.index.clone(),
-                    apply_gate,
-                    self.cancel.clone(),
-                ),
-            );
-
-            self.background.push(
-                "indexer",
-                indexer::spawn(
-                    IndexerSpawnConfig {
-                        ws_url: config.lightpool_ws_url.clone(),
-                        chain: self.state.chain.clone(),
-                        query_account: config.query_account.clone(),
-                        head: self.state.indexed_head.clone(),
-                        index: self.state.index.clone(),
-                        user_hub: self.state.user_hub.clone(),
-                        submit_wait: self.state.submit_wait.clone(),
-                        persist: self.state.persist.clone(),
-                        apply_gate: self.apply_gate.clone(),
-                        peer_catchup,
-                        checkpoint_notify: Some(ckpt_notify),
-                    },
-                    self.cancel.clone(),
-                ),
-            );
-        } else {
-            self.background.push(
-                "indexer",
-                indexer::spawn(
-                    IndexerSpawnConfig {
-                        ws_url: config.lightpool_ws_url.clone(),
-                        chain: self.state.chain.clone(),
-                        query_account: config.query_account.clone(),
-                        head: self.state.indexed_head.clone(),
-                        index: self.state.index.clone(),
-                        user_hub: self.state.user_hub.clone(),
-                        submit_wait: self.state.submit_wait.clone(),
-                        persist: self.state.persist.clone(),
-                        apply_gate: self.apply_gate.clone(),
-                        peer_catchup,
-                        checkpoint_notify: None,
-                    },
-                    self.cancel.clone(),
-                ),
-            );
-        }
+        self.background.push(
+            "indexer",
+            indexer::spawn(
+                IndexerSpawnConfig {
+                    ws_url: config.lightpool_ws_url.clone(),
+                    chain: self.state.chain.clone(),
+                    query_account: config.query_account.clone(),
+                    head: self.state.indexed_head.clone(),
+                    index: self.state.index.clone(),
+                    user_hub: self.state.user_hub.clone(),
+                    submit_wait: self.state.submit_wait.clone(),
+                    persist: self.state.persist.clone(),
+                    apply_gate: self.apply_gate.clone(),
+                    peer_catchup,
+                },
+                self.cancel.clone(),
+            ),
+        );
 
         self.background.push(
             "bars_closer",
@@ -233,33 +193,37 @@ impl App {
             }
 
             if let (Some(persist), Some(apply_gate)) = (shutdown_persist, shutdown_apply_gate) {
-                match indexer::checkpoint_once(
-                    &persist,
-                    &shutdown_head,
-                    &shutdown_index,
-                    &apply_gate,
-                    None,
-                )
-                .await
-                {
-                    Ok(indexer::CheckpointOutcome::Written { block_num, digest }) => {
-                        if !persist
-                            .wait_idle(Duration::from_secs(10))
-                            .await
-                        {
-                            tracing::warn!("persist queue still busy after final checkpoint enqueue");
+                if persist.epoch_checkpoint_configured() {
+                    match indexer::checkpoint_once(
+                        &persist,
+                        &shutdown_head,
+                        &shutdown_index,
+                        &apply_gate,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(indexer::CheckpointOutcome::Written { block_num, digest }) => {
+                            if !persist
+                                .wait_idle(Duration::from_secs(10))
+                                .await
+                            {
+                                tracing::warn!(
+                                    "persist queue still busy after final checkpoint enqueue"
+                                );
+                            }
+                            tracing::info!(
+                                block_num,
+                                digest = %digest,
+                                "final epoch checkpoint completed"
+                            );
                         }
-                        tracing::info!(
-                            block_num,
-                            digest = %digest,
-                            "final sqlite checkpoint completed"
-                        );
-                    }
-                    Ok(indexer::CheckpointOutcome::Skipped) => {
-                        tracing::info!("final sqlite checkpoint skipped");
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "final sqlite checkpoint failed");
+                        Ok(indexer::CheckpointOutcome::Skipped) => {
+                            tracing::info!("final epoch checkpoint skipped");
+                        }
+                        Err(error) => {
+                            tracing::error!(error = %error, "final epoch checkpoint failed");
+                        }
                     }
                 }
             }

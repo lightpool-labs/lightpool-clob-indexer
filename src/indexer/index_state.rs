@@ -5,11 +5,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dashmap::{DashMap, DashSet};
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as TokioRwLock;
 use uuid::Uuid;
 
 use crate::domain::{Market, MarketCategory, MarketQuery, MarketSortOrder, Order, Vault, VaultQuery};
-use crate::persist::{PersistOrderRow, SharedPersist};
+use crate::persist::{
+    index_write_set::{order_row_from_parts, IndexWriteSet},
+    PersistOrderRow, SharedPersist,
+};
 use crate::spot_market::{
     normalize_spot_market_key, onchain_order_id, split_onchain_order_id, OnchainOrderId,
 };
@@ -28,7 +31,7 @@ pub struct IndexedBlockHead {
     pub last_indexed_at_ms: u64,
 }
 
-pub type SharedIndexedBlockHead = Arc<RwLock<IndexedBlockHead>>;
+pub type SharedIndexedBlockHead = Arc<TokioRwLock<IndexedBlockHead>>;
 
 #[derive(Debug, Clone)]
 struct SpotMarketRef {
@@ -121,6 +124,7 @@ impl IndexState {
         }
     }
 
+
     pub async fn clear_all(&self) {
         self.books.clear();
         self.bars.clear().await;
@@ -147,8 +151,22 @@ impl IndexState {
     }
 
     pub async fn export_orders_for_persist(&self) -> Vec<crate::persist::PersistOrderRow> {
+        self.export_orders_for_persist_spots(None).await
+    }
+
+    pub async fn export_orders_for_persist_spots(
+        &self,
+        only_spots: Option<&[String]>,
+    ) -> Vec<crate::persist::PersistOrderRow> {
         self.orders
             .iter()
+            .filter(|e| {
+                let spot = &e.value().spot_market;
+                match only_spots {
+                    Some(spots) => spots.iter().any(|s| s == spot),
+                    None => true,
+                }
+            })
             .map(|e| {
                 let stored = e.value();
                 crate::persist::PersistOrderRow {
@@ -164,8 +182,19 @@ impl IndexState {
     }
 
     pub async fn export_last_trades_for_persist(&self) -> Vec<(String, u64)> {
+        self.export_last_trades_for_persist_spots(None).await
+    }
+
+    pub async fn export_last_trades_for_persist_spots(
+        &self,
+        only_spots: Option<&[String]>,
+    ) -> Vec<(String, u64)> {
         self.last_trade_price
             .iter()
+            .filter(|e| match only_spots {
+                Some(spots) => spots.iter().any(|s| s == e.key()),
+                None => true,
+            })
             .map(|e| (e.key().clone(), *e.value()))
             .collect()
     }
@@ -261,12 +290,15 @@ impl IndexState {
         self.vaults.get(&id).map(|e| e.value().clone())
     }
 
-    pub async fn upsert_vault(&self, vault: Vault) {
+    pub async fn upsert_vault(&self, vault: Vault, mut ws: Option<&mut IndexWriteSet>) {
         let address_key = addr_key(&vault.vault_address);
         let account_key = addr_key(&vault.vault_account);
         self.vault_by_address.insert(address_key, vault.id);
         self.vault_by_account.insert(account_key, vault.id);
         self.vault_portfolio.entry(vault.id).or_default();
+        if let Some(ws) = ws {
+            ws.store_vault(vault.clone());
+        }
         self.vaults.insert(vault.id, vault);
     }
 
@@ -276,6 +308,7 @@ impl IndexState {
         spot_market: &str,
         side: lightpool_sdk::OrderSide,
         fill_amount: u64,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         if fill_amount == 0 {
             return;
@@ -307,7 +340,12 @@ impl IndexState {
         if next == 0 {
             holdings.remove(&market_key);
         } else {
-            holdings.insert(market_key, next);
+            holdings.insert(market_key.clone(), next);
+        }
+        let vault_id_str = vault_id.to_string();
+        drop(holdings);
+        if let Some(ws) = ws {
+            ws.store_vault_portfolio(&vault_id_str, &market_key, next as i64);
         }
     }
 
@@ -328,37 +366,40 @@ impl IndexState {
         assets
     }
 
-    pub async fn update_vault_equity(&self, vault_address: &str, equity: &str) {
+    pub async fn update_vault_equity(&self, vault_address: &str, equity: &str, mut ws: Option<&mut IndexWriteSet>) {
         let key = addr_key(vault_address);
         let Some(id) = self.vault_by_address.get(&key).map(|e| *e) else {
             return;
         };
         if let Some(mut vault) = self.vaults.get_mut(&id) {
             vault.equity = equity.to_string();
+            if let Some(ws) = ws { ws.store_vault(vault.clone()); }
         }
     }
 
-    pub async fn update_vault_allow_deposit(&self, vault_address: &str, allow_deposit: bool) {
+    pub async fn update_vault_allow_deposit(&self, vault_address: &str, allow_deposit: bool, mut ws: Option<&mut IndexWriteSet>) {
         let key = addr_key(vault_address);
         let Some(id) = self.vault_by_address.get(&key).map(|e| *e) else {
             return;
         };
         if let Some(mut vault) = self.vaults.get_mut(&id) {
             vault.allow_deposit = allow_deposit;
+            if let Some(ws) = ws { ws.store_vault(vault.clone()); }
         }
     }
 
-    pub async fn update_vault_manager(&self, vault_address: &str, manager: &str) {
+    pub async fn update_vault_manager(&self, vault_address: &str, manager: &str, mut ws: Option<&mut IndexWriteSet>) {
         let key = addr_key(vault_address);
         let Some(id) = self.vault_by_address.get(&key).map(|e| *e) else {
             return;
         };
         if let Some(mut vault) = self.vaults.get_mut(&id) {
             vault.manager = manager.to_string();
+            if let Some(ws) = ws { ws.store_vault(vault.clone()); }
         }
     }
 
-    pub async fn mark_vault_closed(&self, vault_address: &str) {
+    pub async fn mark_vault_closed(&self, vault_address: &str, mut ws: Option<&mut IndexWriteSet>) {
         let key = addr_key(vault_address);
         let Some(id) = self.vault_by_address.get(&key).map(|e| *e) else {
             return;
@@ -366,6 +407,7 @@ impl IndexState {
         if let Some(mut vault) = self.vaults.get_mut(&id) {
             vault.is_closed = true;
             vault.allow_deposit = false;
+            if let Some(ws) = ws { ws.store_vault(vault.clone()); }
         }
     }
 
@@ -508,7 +550,7 @@ impl IndexState {
         self.slug_to_market.retain(|_, id| *id != market_id);
     }
 
-    pub async fn upsert_market(&self, mut market: Market) {
+    pub async fn upsert_market(&self, mut market: Market, mut ws: Option<&mut IndexWriteSet>) {
         if let Some(existing) = self.markets.get(&market.id()) {
             market.set_icon_url_if_empty(existing.icon_url().cloned());
             if let (Some(slot), existing_name) = (market.name_mut(), existing.name()) {
@@ -561,11 +603,14 @@ impl IndexState {
 
         let market_id = market.id();
         let category = market.category();
+        if let Some(ws) = ws.as_deref_mut() {
+            ws.store_market(market.clone());
+        }
         self.markets.insert(market_id, market);
 
         match category {
             MarketCategory::Event => {
-                self.bind_event_spot_legs(market_id, &yes_spot, &no_spot);
+                self.bind_event_spot_legs(market_id, &yes_spot, &no_spot, ws);
             }
             MarketCategory::Spot => {
                 self.spot_to_market.insert(
@@ -589,9 +634,9 @@ impl IndexState {
     }
 
     /// Point yes/no spot venues at an event instrument; drop orphan spot shells for those addresses.
-    fn bind_event_spot_legs(&self, event_id: Uuid, yes_spot: &str, no_spot: &str) {
+    fn bind_event_spot_legs(&self, event_id: Uuid, yes_spot: &str, no_spot: &str, mut ws: Option<&mut IndexWriteSet>) {
         for (spot, outcome) in [(yes_spot, "yes"), (no_spot, "no")] {
-            self.remove_orphan_spot_shell(spot);
+            self.remove_orphan_spot_shell(spot, ws.as_deref_mut());
             self.spot_to_market.insert(
                 spot.to_string(),
                 SpotMarketRef {
@@ -602,7 +647,7 @@ impl IndexState {
         }
     }
 
-    fn remove_orphan_spot_shell(&self, spot_market: &str) {
+    fn remove_orphan_spot_shell(&self, spot_market: &str, mut ws: Option<&mut IndexWriteSet>) {
         let orphan_id = market_uuid(spot_market);
         let Some((_, orphan)) = self.markets.remove(&orphan_id) else {
             return;
@@ -612,12 +657,16 @@ impl IndexState {
             return;
         }
         // Spot shells are not in slug_to_market; event slug entries are left untouched.
+        if let Some(ws) = ws { ws.delete_market(&orphan_id.to_string()); }
     }
 
-    pub async fn update_market_state(&self, market_address: &str, state: &str) {
+    pub async fn update_market_state(&self, market_address: &str, state: &str, mut ws: Option<&mut IndexWriteSet>) {
         for mut market in self.markets.iter_mut() {
             if market.market_address() == market_address {
                 *market.state_mut() = state.to_string();
+                if let Some(ws) = ws.as_deref_mut() {
+                    ws.store_market(market.clone());
+                }
             }
         }
     }
@@ -708,9 +757,10 @@ impl IndexState {
         self.spot_by_name.get(&upper).map(|e| e.value().clone())
     }
 
-    pub async fn record_last_trade_price(&self, spot_market: &str, price: u64) {
+    pub async fn record_last_trade_price(&self, spot_market: &str, price: u64, mut ws: Option<&mut IndexWriteSet>) {
         let key = normalize_spot_market_key(spot_market);
-        self.last_trade_price.insert(key, price);
+        self.last_trade_price.insert(key.clone(), price);
+        if let Some(ws) = ws { ws.store_last_trade(&key, price as i64); }
     }
 
     pub async fn last_trade_price(&self, spot_market: &str) -> Option<u64> {
@@ -783,6 +833,7 @@ impl IndexState {
         chain_order_id: String,
         size_raw: u64,
         filled_raw: u64,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         let spot = normalize_spot_market_key(spot_market);
         let stored = StoredOrder {
@@ -805,6 +856,16 @@ impl IndexState {
             .entry(user)
             .or_default()
             .insert(order_id);
+        if let Some(ws) = ws {
+            ws.store_order(order_row_from_parts(
+                stored.order.clone(),
+                stored.user_address.clone(),
+                stored.chain_order_id.clone(),
+                stored.spot_market.clone(),
+                stored.size_raw,
+                stored.filled_raw,
+            ));
+        }
         self.orders.insert(order_id, stored);
     }
 
@@ -825,9 +886,10 @@ impl IndexState {
         self.orders.remove(&order_id);
     }
 
-    fn archive_terminal_order(&self, order_id: Uuid, stored: StoredOrder) {
+    fn archive_terminal_order(&self, order_id: Uuid, stored: StoredOrder, mut ws: Option<&mut IndexWriteSet>) {
         let row = stored_to_persist_row(&stored);
         self.remove_hot_order(order_id, &stored);
+        if let Some(ws) = ws { ws.delete_order(&order_id.to_string()); }
         self.write_order_history(&row);
     }
 
@@ -906,7 +968,7 @@ impl IndexState {
         ))
     }
 
-    pub async fn update_order_cancelled(&self, spot_market: &str, chain_order_id: &str) {
+    pub async fn update_order_cancelled(&self, spot_market: &str, chain_order_id: &str, mut ws: Option<&mut IndexWriteSet>) {
         let key = onchain_order_id(spot_market, chain_order_id);
         let Some(order_id) = self.orders_by_id.get(&key).map(|e| *e) else {
             return;
@@ -917,7 +979,7 @@ impl IndexState {
         stored.order.status = "cancelled".into();
         let snapshot = stored.clone();
         drop(stored);
-        self.archive_terminal_order(order_id, snapshot);
+        self.archive_terminal_order(order_id, snapshot, ws);
     }
 
     pub async fn update_order_amount(
@@ -926,6 +988,7 @@ impl IndexState {
         chain_order_id: &str,
         new_amount: u64,
         remaining_amount: u64,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         let key = onchain_order_id(spot_market, chain_order_id);
         let Some(order_id) = self.orders_by_id.get(&key).map(|e| *e) else {
@@ -948,11 +1011,21 @@ impl IndexState {
         let snapshot = if terminal {
             Some(stored.clone())
         } else {
+            if let Some(ws) = ws.as_deref_mut() {
+                ws.store_order(order_row_from_parts(
+                    stored.order.clone(),
+                    stored.user_address.clone(),
+                    stored.chain_order_id.clone(),
+                    stored.spot_market.clone(),
+                    stored.size_raw,
+                    stored.filled_raw,
+                ));
+            }
             None
         };
         drop(stored);
         if let Some(snapshot) = snapshot {
-            self.archive_terminal_order(order_id, snapshot);
+            self.archive_terminal_order(order_id, snapshot, ws);
         }
     }
 
@@ -963,6 +1036,7 @@ impl IndexState {
         fill_amount: u64,
         remaining_amount: u64,
         is_fully_filled: bool,
+        mut ws: Option<&mut IndexWriteSet>,
     ) {
         let key = onchain_order_id(spot_market, chain_order_id);
         let Some(order_id) = self.orders_by_id.get(&key).map(|e| *e) else {
@@ -982,11 +1056,21 @@ impl IndexState {
         let snapshot = if terminal {
             Some(stored.clone())
         } else {
+            if let Some(ws) = ws.as_deref_mut() {
+                ws.store_order(order_row_from_parts(
+                    stored.order.clone(),
+                    stored.user_address.clone(),
+                    stored.chain_order_id.clone(),
+                    stored.spot_market.clone(),
+                    stored.size_raw,
+                    stored.filled_raw,
+                ));
+            }
             None
         };
         drop(stored);
         if let Some(snapshot) = snapshot {
-            self.archive_terminal_order(order_id, snapshot);
+            self.archive_terminal_order(order_id, snapshot, ws);
         }
     }
 }
@@ -1010,7 +1094,7 @@ pub fn rebuild_order_indexes(store: &IndexState) {
 }
 
 pub fn new_head() -> SharedIndexedBlockHead {
-    Arc::new(RwLock::new(IndexedBlockHead::default()))
+    Arc::new(TokioRwLock::new(IndexedBlockHead::default()))
 }
 
 pub fn market_uuid(market_address: &str) -> Uuid {

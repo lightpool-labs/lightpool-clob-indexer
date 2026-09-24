@@ -7,7 +7,6 @@ mod processor;
 mod index_state;
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,7 +65,6 @@ pub struct IndexerSpawnConfig {
     pub persist: Option<SharedPersist>,
     pub apply_gate: Option<IndexApplyGate>,
     pub peer_catchup: Option<PeerCatchupConfig>,
-    pub checkpoint_notify: Option<CheckpointNotifier>,
 }
 
 pub fn new_apply_gate() -> IndexApplyGate {
@@ -85,7 +83,6 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
         persist,
         apply_gate,
         mut peer_catchup,
-        checkpoint_notify,
     } = cfg;
     tokio::spawn(async move {
         let mut first = true;
@@ -117,7 +114,6 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
                     persist.clone(),
                     apply_gate.clone(),
                     catchup,
-                    checkpoint_notify.clone(),
                     cancel.clone(),
                 ) => result,
             };
@@ -129,6 +125,7 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
             }
             if let Some(persist) = &persist {
                 persist.set_secondary_persist(true);
+                persist.set_epoch_checkpoint(true);
             }
 
             if cancel.is_cancelled() {
@@ -168,118 +165,13 @@ pub fn spawn_bars_closer(index: SharedIndexState, cancel: CancellationToken) -> 
     })
 }
 
-/// Capacity-1 signal: apply path notifies when enough receipt blocks accumulated.
-#[derive(Clone)]
-pub struct CheckpointNotifier {
-    tx: mpsc::Sender<()>,
-    every_blocks: u64,
-    since_checkpoint: Arc<AtomicU64>,
-}
-
-impl CheckpointNotifier {
-    pub fn on_block_applied(&self, catching_up: bool) {
-        if catching_up || self.every_blocks == 0 {
-            return;
-        }
-        let n = self.since_checkpoint.fetch_add(1, Ordering::Relaxed) + 1;
-        if n < self.every_blocks {
-            return;
-        }
-        // Coalesce: capacity-1 channel; if a request is already pending, keep counting.
-        if self.tx.try_send(()).is_ok() {
-            tracing::info!(
-                since_checkpoint = n,
-                every_blocks = self.every_blocks,
-                "checkpoint requested after applied blocks"
-            );
-        }
-    }
-
-    pub fn reset_after_checkpoint(&self) {
-        self.since_checkpoint.store(0, Ordering::Relaxed);
-    }
-}
-
-pub fn new_checkpoint_channel(every_blocks: u64) -> (CheckpointNotifier, mpsc::Receiver<()>) {
-    let (tx, rx) = mpsc::channel(1);
-    (
-        CheckpointNotifier {
-            tx,
-            every_blocks,
-            since_checkpoint: Arc::new(AtomicU64::new(0)),
-        },
-        rx,
-    )
-}
-
-pub fn spawn_checkpoint_worker(
-    mut rx: mpsc::Receiver<()>,
-    notifier: CheckpointNotifier,
-    persist: SharedPersist,
-    head: SharedIndexedBlockHead,
-    index: SharedIndexState,
-    apply_gate: IndexApplyGate,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut last_block_num = u64::MAX;
-        let mut last_digest = String::new();
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    tracing::info!("checkpoint worker cancelled");
-                    break;
-                }
-                msg = rx.recv() => {
-                    if msg.is_none() {
-                        tracing::info!("checkpoint notify channel closed");
-                        break;
-                    }
-                }
-            }
-
-            match checkpoint_once(
-                &persist,
-                &head,
-                &index,
-                &apply_gate,
-                Some((last_block_num, last_digest.as_str())),
-            )
-            .await
-            {
-                Ok(CheckpointOutcome::Skipped) => {
-                    let catching_up = head.read().await.catching_up;
-                    if !catching_up {
-                        // Head unchanged; wait for another full window of applies.
-                        notifier.reset_after_checkpoint();
-                    }
-                }
-                Ok(CheckpointOutcome::Written { block_num, digest }) => {
-                    tracing::info!(
-                        block_num,
-                        digest = %digest,
-                        "block-triggered sqlite checkpoint completed"
-                    );
-                    last_block_num = block_num;
-                    last_digest = digest;
-                    notifier.reset_after_checkpoint();
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "block-triggered sqlite checkpoint failed");
-                }
-            }
-        }
-    })
-}
-
 #[derive(Debug)]
 pub enum CheckpointOutcome {
     Skipped,
     Written { block_num: u64, digest: String },
 }
 
+/// Epoch checkpoint: wait for live state mirror to catch up, then clone sqlite file.
 pub async fn checkpoint_once(
     persist: &SharedPersist,
     head: &SharedIndexedBlockHead,
@@ -287,57 +179,140 @@ pub async fn checkpoint_once(
     apply_gate: &IndexApplyGate,
     skip_if: Option<(u64, &str)>,
 ) -> AppResult<CheckpointOutcome> {
-    let (block_num, digest, catching_up, snapshot) = {
-        let _apply = apply_gate.lock().await;
-        let (block_num, digest, catching_up) = {
-            let state = head.read().await;
-            (state.block_num, state.digest.clone(), state.catching_up)
-        };
-
-        if digest.is_empty() {
-            return Ok(CheckpointOutcome::Skipped);
-        }
-
-        if let Some((last_block_num, last_digest)) = skip_if {
-            if catching_up || (block_num == last_block_num && digest == last_digest) {
-                return Ok(CheckpointOutcome::Skipped);
-            }
-        } else if catching_up {
-            tracing::warn!(
-                block_num,
-                "final checkpoint while catching_up; persisting current head"
-            );
-        }
-
-        let markets = index.export_markets_for_persist().await;
-        let orders = index.export_orders_for_persist().await;
-        let last_trades = index.export_last_trades_for_persist().await;
-        let vaults = index.export_vaults_for_persist().await;
-        let vault_portfolio = index.export_vault_portfolio_for_persist().await;
-        let (levels, metas) = index.books.export_for_persist().await;
-        (
-            block_num,
-            digest,
-            catching_up,
-            (markets, orders, last_trades, levels, metas, vaults, vault_portfolio),
-        )
+    // Hold apply gate for the whole epoch so live state cannot race the clone.
+    let _apply = apply_gate.lock().await;
+    let (block_num, digest, catching_up) = {
+        let state = head.read().await;
+        (state.block_num, state.digest.clone(), state.catching_up)
     };
 
-    let (markets, orders, last_trades, levels, metas, vaults, vault_portfolio) = snapshot;
-    let _ = catching_up;
-    persist.enqueue_checkpoint(
-        block_num,
-        digest.clone(),
-        markets,
-        orders,
-        last_trades,
-        levels,
-        metas,
-        vaults,
-        vault_portfolio,
-    );
+    if digest.is_empty() {
+        return Ok(CheckpointOutcome::Skipped);
+    }
+
+    if let Some((last_block_num, last_digest)) = skip_if {
+        if catching_up || (block_num == last_block_num && digest == last_digest) {
+            return Ok(CheckpointOutcome::Skipped);
+        }
+    } else if catching_up {
+        tracing::warn!(
+            block_num,
+            "final epoch checkpoint while catching_up; cloning current state db"
+        );
+    }
+
+    if !persist.wait_idle(Duration::from_secs(60)).await {
+        tracing::warn!(
+            block_num,
+            "persist still busy before epoch clone; forcing full state sync"
+        );
+        force_full_index_write(persist, index, block_num, digest.clone()).await;
+        let _ = persist.wait_idle(Duration::from_secs(60)).await;
+    } else {
+        let meta = persist.meta()?;
+        let needs_sync = match meta {
+            Some(m) => m.block_num != block_num || m.digest != digest,
+            None => true,
+        };
+        if needs_sync {
+            force_full_index_write(persist, index, block_num, digest.clone()).await;
+            let _ = persist.wait_idle(Duration::from_secs(60)).await;
+        }
+    }
+
+    let persist_clone = persist.clone();
+    let digest_clone = digest.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_clone.clone_epoch_checkpoint(block_num, &digest_clone)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("epoch clone join: {e}")))??;
 
     Ok(CheckpointOutcome::Written { block_num, digest })
+}
+
+async fn force_full_index_write(
+    persist: &SharedPersist,
+    index: &SharedIndexState,
+    block_num: u64,
+    digest: String,
+) {
+    let markets = index.export_markets_for_persist().await;
+    let orders = index.export_orders_for_persist().await;
+    let last_trades = index.export_last_trades_for_persist().await;
+    let vaults = index.export_vaults_for_persist().await;
+    let vault_portfolio = index.export_vault_portfolio_for_persist().await;
+    let (levels, metas) = index.books.export_for_persist().await;
+
+    let mut ws = crate::persist::IndexWriteSet {
+        block_num,
+        digest,
+        full_replace: true,
+        ..Default::default()
+    };
+    for market in markets {
+        ws.markets_to_store
+            .insert(market.id().to_string(), market);
+    }
+    for row in orders {
+        let id = row.order.id.to_string();
+        ws.orders_to_store.insert(
+            id.clone(),
+            crate::persist::index_write_set::order_row_from_parts(
+                row.order,
+                row.user_address,
+                row.chain_order_id,
+                row.spot_market,
+                row.size_raw,
+                row.filled_raw,
+            ),
+        );
+    }
+    for level in levels {
+        if level.size_raw == 0 {
+            continue;
+        }
+        ws.book_levels_to_store.insert(
+            (
+                crate::spot_market::normalize_spot_market_key(&level.spot_market),
+                level.side,
+                level.price_raw as i64,
+            ),
+            level.size_raw as i64,
+        );
+    }
+    for meta in metas {
+        ws.book_meta_to_store.insert(
+            crate::spot_market::normalize_spot_market_key(&meta.spot_market),
+            crate::persist::index_state_tables::BookMetaRow {
+                sequence: meta.sequence as i64,
+                last_trade_price: meta.last_trade_price.map(|v| v as i64),
+            },
+        );
+    }
+    for (spot, price) in last_trades {
+        ws.last_trades_to_store.insert(
+            crate::spot_market::normalize_spot_market_key(&spot),
+            price as i64,
+        );
+    }
+    for mut vault in vaults {
+        vault.portfolio.clear();
+        ws.vaults_to_store.insert(vault.id.to_string(), vault);
+    }
+    for row in vault_portfolio {
+        if row.amount_raw == 0 {
+            continue;
+        }
+        ws.vault_portfolio_to_store.insert(
+            (
+                row.vault_id,
+                crate::spot_market::normalize_spot_market_key(&row.spot_market),
+            ),
+            row.amount_raw as i64,
+        );
+    }
+    persist.enqueue_index_write(ws).await;
 }
 
 pub async fn recover_from_persist(
@@ -399,7 +374,6 @@ async fn run_once(
     persist: Option<SharedPersist>,
     apply_gate: Option<IndexApplyGate>,
     peer_catchup: Option<PeerCatchupConfig>,
-    checkpoint_notify: Option<CheckpointNotifier>,
     cancel: CancellationToken,
 ) -> AppResult<()> {
     if cancel.is_cancelled() {
@@ -411,7 +385,7 @@ async fn run_once(
             Some(gate) => Some(gate.lock().await),
             None => None,
         };
-        if let Err(error) = hydrate_all_spot_markets(chain, &index, query_account).await
+        if let Err(error) = hydrate_all_spot_markets(chain, &index, query_account, None).await
         {
             tracing::warn!(error = %error, "startup spot market hydration failed");
         }
@@ -472,7 +446,6 @@ async fn run_once(
             submit_wait: submit_wait.clone(),
             persist: persist.clone(),
             apply_gate: apply_gate.clone(),
-            checkpoint_notify,
             cancel: cancel.clone(),
         },
     )
@@ -688,9 +661,10 @@ async fn run_peer_catchup(
         {
             let mut state = head.write().await;
             state.block_num = tip.block_num;
-            state.digest = tip.digest;
+            state.digest = tip.digest.clone();
             state.catching_up = false;
         }
+        force_full_index_write(persist, index, tip.block_num, tip.digest).await;
         persist.set_secondary_persist(true);
     }
 

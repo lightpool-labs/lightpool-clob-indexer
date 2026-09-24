@@ -25,8 +25,7 @@ use crate::ws::process::SharedUserEventHub;
 use super::processor::{prepare_block, process_prepared_block, ProcessOpts, PreparedBlock};
 use super::index_state::{SharedIndexState, SharedIndexedBlockHead};
 use super::{
-    CheckpointNotifier, IndexApplyGate, PIPELINE_PREPARED_CAPACITY, PIPELINE_RAW_CAPACITY,
-    QUIET_APPLY_BACKLOG,
+    IndexApplyGate, PIPELINE_PREPARED_CAPACITY, PIPELINE_RAW_CAPACITY, QUIET_APPLY_BACKLOG,
 };
 
 pub struct LivePipelineConfig {
@@ -38,7 +37,6 @@ pub struct LivePipelineConfig {
     pub submit_wait: SharedSubmitWaitRegistry,
     pub persist: Option<SharedPersist>,
     pub apply_gate: Option<IndexApplyGate>,
-    pub checkpoint_notify: Option<CheckpointNotifier>,
     pub cancel: CancellationToken,
 }
 
@@ -115,7 +113,6 @@ pub async fn run_live_pipeline(
     let apply_wait = cfg.submit_wait.clone();
     let apply_gate = cfg.apply_gate.clone();
     let persist_apply = cfg.persist.clone();
-    let checkpoint_notify = cfg.checkpoint_notify.clone();
     let apply_worker = tokio::spawn(async move {
         while let Some(prepared) = prepared_rx.recv().await {
             if cancel_apply.is_cancelled() {
@@ -128,6 +125,7 @@ pub async fn run_live_pipeline(
             let quiet = catching_up || remaining >= QUIET_APPLY_BACKLOG;
             if let Some(persist) = persist_apply.as_ref() {
                 persist.set_secondary_persist(!quiet);
+                persist.set_epoch_checkpoint(!catching_up);
             }
             if quiet && remaining > 0 && remaining.is_multiple_of(50) {
                 tracing::warn!(
@@ -146,12 +144,12 @@ pub async fn run_live_pipeline(
                 ProcessOpts::default()
             };
 
-            {
+            let write_set = {
                 let _apply = match &apply_gate {
                     Some(gate) => Some(gate.lock().await),
                     None => None,
                 };
-                process_prepared_block(
+                let write_set = process_prepared_block(
                     &apply_chain,
                     &apply_query,
                     &apply_index,
@@ -164,16 +162,17 @@ pub async fn run_live_pipeline(
 
                 let mut state = apply_head.write().await;
                 state.block_num = block_num;
-                state.digest = digest;
+                state.digest = digest.clone();
                 state.tx_count = tx_count;
                 state.last_indexed_at_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-            }
+                write_set
+            };
 
-            if let Some(notify) = checkpoint_notify.as_ref() {
-                notify.on_block_applied(catching_up);
+            if let Some(persist) = persist_apply.as_ref() {
+                persist.enqueue_index_write(write_set).await;
             }
         }
     });

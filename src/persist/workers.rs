@@ -12,8 +12,9 @@ use tokio::time::timeout_at;
 
 use crate::error::AppError;
 
-use super::checkpoint;
+use super::index_state_write;
 use super::op::{encode_persist_op, EncodedPersistOp};
+use super::index_state_tables::IndexStateStore;
 use super::store::{BlockStore, StateStore};
 use super::timing::{persist_timing, TimedEncodedOp, TimedPersistOp};
 use super::types::{
@@ -27,114 +28,180 @@ struct EncodedBatch {
 
 pub struct PersistWorkers {
     pub(crate) blocks: Arc<Mutex<BlockStore>>,
+    /// Sqlite for order_history + bars.
     pub(crate) state: Arc<Mutex<StateStore>>,
+    pub(crate) index: Arc<IndexStateStore>,
+    pub(crate) index_write_gate: Arc<Mutex<()>>,
     pub(crate) pending: Arc<AtomicU64>,
-    pub(crate) rx: mpsc::Receiver<TimedPersistOp>,
-    pub(crate) ckpt_rx: mpsc::Receiver<TimedPersistOp>,
+    /// Blocks sqlite ingress; None when disabled.
+    pub(crate) blocks_rx: Option<mpsc::Receiver<TimedPersistOp>>,
+    /// History (order_history / bars) sqlite ingress.
+    pub(crate) history_rx: mpsc::Receiver<TimedPersistOp>,
+    /// IndexWriteSet ingress (RocksDB index-state); None when disabled.
+    pub(crate) index_state_write_rx: Option<mpsc::Receiver<TimedPersistOp>>,
+    pub(crate) index_path: std::path::PathBuf,
+    pub(crate) epoch_length: u64,
+    pub(crate) epoch_ckpt_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PersistWorkers {
-    /// Spawn block/secondary encode×N + dual write, plus dedicated checkpoint pipeline.
+    /// Spawn persist pipelines: history, and optionally blocks / index-state.
     pub fn spawn(self) -> Vec<(String, JoinHandle<()>)> {
-        let encode_workers = DEFAULT_PERSIST_ENCODE_WORKERS.max(1);
-        let batch_max = DEFAULT_PERSIST_BATCH_MAX.max(1);
-        let batch_wait = Duration::from_millis(DEFAULT_PERSIST_BATCH_WAIT_MS);
-        tracing::info!(
-            encode_workers,
-            batch_max,
-            batch_wait_ms = batch_wait.as_millis(),
-            "persist pipeline starting (encode×N → blocks|secondary; checkpoint dedicated)"
-        );
-
-        let (block_enc_tx, block_enc_rx) =
-            mpsc::channel::<TimedEncodedOp>(encode_workers * 2);
-        let (secondary_enc_tx, secondary_enc_rx) =
-            mpsc::channel::<TimedEncodedOp>(encode_workers * 2);
-        let (block_batch_tx, block_batch_rx) = mpsc::channel::<EncodedBatch>(2);
-        let (secondary_batch_tx, secondary_batch_rx) = mpsc::channel::<EncodedBatch>(2);
-
-        let op_rx = Arc::new(tokio::sync::Mutex::new(self.rx));
+        let pending = Arc::clone(&self.pending);
         let mut handles = Vec::new();
-
-        for worker_id in 0..encode_workers {
-            let op_rx = Arc::clone(&op_rx);
-            let block_enc_tx = block_enc_tx.clone();
-            let secondary_enc_tx = secondary_enc_tx.clone();
-            let pending = Arc::clone(&self.pending);
-            handles.push((
-                format!("persist_encode_{worker_id}"),
-                tokio::spawn(async move {
-                    run_persist_encode(
-                        worker_id,
-                        op_rx,
-                        block_enc_tx,
-                        secondary_enc_tx,
-                        pending,
-                    )
-                    .await;
-                }),
+        if let Some(rx) = self.blocks_rx {
+            handles.extend(spawn_blocks_persist(
+                rx,
+                self.blocks,
+                Arc::clone(&pending),
             ));
+        } else {
+            tracing::info!("persist blocks sqlite pipeline disabled");
         }
-        drop(block_enc_tx);
-        drop(secondary_enc_tx);
-
-        handles.push((
-            "persist_coalesce_blocks".into(),
-            tokio::spawn(async move {
-                run_persist_coalesce(block_enc_rx, block_batch_tx, batch_max, batch_wait, "blocks")
-                    .await;
-            }),
-        ));
-        handles.push((
-            "persist_coalesce_secondary".into(),
-            tokio::spawn(async move {
-                run_persist_coalesce(
-                    secondary_enc_rx,
-                    secondary_batch_tx,
-                    batch_max,
-                    batch_wait,
-                    "secondary",
-                )
-                .await;
-            }),
-        ));
-
-        let blocks = self.blocks.clone();
-        let pending_blocks = Arc::clone(&self.pending);
-        handles.push((
-            "persist_write_blocks".into(),
-            tokio::spawn(async move {
-                run_persist_write_blocks(block_batch_rx, blocks, pending_blocks).await;
-            }),
-        ));
-
-        let state_secondary = self.state.clone();
-        let pending_secondary = Arc::clone(&self.pending);
-        handles.push((
-            "persist_write_secondary".into(),
-            tokio::spawn(async move {
-                run_persist_write_secondary(secondary_batch_rx, state_secondary, pending_secondary)
-                    .await;
-            }),
-        ));
-
-        handles.extend(checkpoint::spawn(
-            self.ckpt_rx,
+        handles.extend(spawn_history_persist(
+            self.history_rx,
             self.state,
-            self.blocks,
-            self.pending,
+            Arc::clone(&pending),
         ));
-
+        if let Some(rx) = self.index_state_write_rx {
+            handles.extend(spawn_index_state_write(
+                rx,
+                self.index,
+                self.index_write_gate,
+                pending,
+                self.index_path,
+                self.epoch_length,
+                self.epoch_ckpt_enabled,
+            ));
+        } else {
+            tracing::info!("persist index-state WriteBatch pipeline disabled");
+        }
         handles
     }
 }
 
-async fn run_persist_encode(
+fn spawn_blocks_persist(
+    rx: mpsc::Receiver<TimedPersistOp>,
+    blocks: Arc<Mutex<BlockStore>>,
+    pending: Arc<AtomicU64>,
+) -> Vec<(String, JoinHandle<()>)> {
+    let encode_workers = DEFAULT_PERSIST_ENCODE_WORKERS.max(1);
+    let batch_max = DEFAULT_PERSIST_BATCH_MAX.max(1);
+    let batch_wait = Duration::from_millis(DEFAULT_PERSIST_BATCH_WAIT_MS);
+    tracing::info!(
+        encode_workers,
+        batch_max,
+        batch_wait_ms = batch_wait.as_millis(),
+        "persist blocks pipeline starting (encode → coalesce → write)"
+    );
+
+    let (enc_tx, enc_rx) = mpsc::channel::<TimedEncodedOp>(encode_workers * 2);
+    let (batch_tx, batch_rx) = mpsc::channel::<EncodedBatch>(2);
+    let op_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let mut handles = Vec::new();
+
+    for worker_id in 0..encode_workers {
+        let op_rx = Arc::clone(&op_rx);
+        let enc_tx = enc_tx.clone();
+        let pending = Arc::clone(&pending);
+        handles.push((
+            format!("persist_sqlite_encode_blocks_{worker_id}"),
+            tokio::spawn(async move {
+                run_sqlite_encode(worker_id, op_rx, enc_tx, pending, "blocks").await;
+            }),
+        ));
+    }
+    drop(enc_tx);
+
+    handles.push((
+        "persist_blocks_coalesce".into(),
+        tokio::spawn(async move {
+            run_coalesce(enc_rx, batch_tx, batch_max, batch_wait, "blocks").await;
+        }),
+    ));
+    handles.push((
+        "persist_blocks_write".into(),
+        tokio::spawn(async move {
+            run_blocks_write(batch_rx, blocks, pending).await;
+        }),
+    ));
+    handles
+}
+
+fn spawn_history_persist(
+    rx: mpsc::Receiver<TimedPersistOp>,
+    state: Arc<Mutex<StateStore>>,
+    pending: Arc<AtomicU64>,
+) -> Vec<(String, JoinHandle<()>)> {
+    let encode_workers = DEFAULT_PERSIST_ENCODE_WORKERS.max(1);
+    let batch_max = DEFAULT_PERSIST_BATCH_MAX.max(1);
+    let batch_wait = Duration::from_millis(DEFAULT_PERSIST_BATCH_WAIT_MS);
+    tracing::info!(
+        encode_workers,
+        batch_max,
+        batch_wait_ms = batch_wait.as_millis(),
+        "persist history pipeline starting (encode → coalesce → write)"
+    );
+
+    let (enc_tx, enc_rx) = mpsc::channel::<TimedEncodedOp>(encode_workers * 2);
+    let (batch_tx, batch_rx) = mpsc::channel::<EncodedBatch>(2);
+    let op_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let mut handles = Vec::new();
+
+    for worker_id in 0..encode_workers {
+        let op_rx = Arc::clone(&op_rx);
+        let enc_tx = enc_tx.clone();
+        let pending = Arc::clone(&pending);
+        handles.push((
+            format!("persist_sqlite_encode_history_{worker_id}"),
+            tokio::spawn(async move {
+                run_sqlite_encode(worker_id, op_rx, enc_tx, pending, "history").await;
+            }),
+        ));
+    }
+    drop(enc_tx);
+
+    handles.push((
+        "persist_history_coalesce".into(),
+        tokio::spawn(async move {
+            run_coalesce(enc_rx, batch_tx, batch_max, batch_wait, "history").await;
+        }),
+    ));
+    handles.push((
+        "persist_history_write".into(),
+        tokio::spawn(async move {
+            run_history_write(batch_rx, state, pending).await;
+        }),
+    ));
+    handles
+}
+
+fn spawn_index_state_write(
+    rx: mpsc::Receiver<TimedPersistOp>,
+    index: Arc<IndexStateStore>,
+    write_gate: Arc<Mutex<()>>,
+    pending: Arc<AtomicU64>,
+    index_path: std::path::PathBuf,
+    epoch_length: u64,
+    epoch_ckpt_enabled: Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<(String, JoinHandle<()>)> {
+    index_state_write::spawn(
+        rx,
+        index,
+        write_gate,
+        pending,
+        index_path,
+        epoch_length,
+        epoch_ckpt_enabled,
+    )
+}
+
+async fn run_sqlite_encode(
     worker_id: usize,
     op_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<TimedPersistOp>>>,
-    block_enc_tx: mpsc::Sender<TimedEncodedOp>,
-    secondary_enc_tx: mpsc::Sender<TimedEncodedOp>,
+    enc_tx: mpsc::Sender<TimedEncodedOp>,
     pending: Arc<AtomicU64>,
+    lane: &'static str,
 ) {
     loop {
         let timed = {
@@ -153,40 +220,46 @@ async fn run_persist_encode(
             Ok(Err(error)) => {
                 pending.fetch_sub(1, Ordering::Relaxed);
                 persist_timing().cancel(op_id);
-                tracing::error!(worker_id, op_id, error = %error, "persist encode failed");
+                tracing::error!(
+                    worker_id,
+                    lane,
+                    op_id,
+                    error = %error,
+                    "persist sqlite encode failed"
+                );
                 continue;
             }
             Err(error) => {
                 pending.fetch_sub(1, Ordering::Relaxed);
                 persist_timing().cancel(op_id);
-                tracing::error!(worker_id, op_id, error = %error, "persist encode join failed");
+                tracing::error!(
+                    worker_id,
+                    lane,
+                    op_id,
+                    error = %error,
+                    "persist sqlite encode join failed"
+                );
                 continue;
             }
         };
         persist_timing().mark_encode_done(op_id);
 
-        let is_block = encoded.is_block();
         let timed_encoded = TimedEncodedOp {
             op_id,
             op: encoded,
         };
-        let send_result = if is_block {
-            block_enc_tx.send(timed_encoded).await
-        } else {
-            secondary_enc_tx.send(timed_encoded).await
-        };
-        if send_result.is_err() {
+        if enc_tx.send(timed_encoded).await.is_err() {
             pending.fetch_sub(1, Ordering::Relaxed);
             persist_timing().cancel(op_id);
-            tracing::error!(worker_id, "persist coalesce stopped; dropping encoded op");
+            tracing::error!(worker_id, lane, "persist coalesce stopped; dropping encoded op");
             break;
         }
         persist_timing().mark_encoded_sent(op_id);
     }
-    tracing::info!(worker_id, "persist encode stopped");
+    tracing::info!(worker_id, lane, "persist sqlite encode stopped");
 }
 
-async fn run_persist_coalesce(
+async fn run_coalesce(
     mut rx: mpsc::Receiver<TimedEncodedOp>,
     batch_tx: mpsc::Sender<EncodedBatch>,
     batch_max: usize,
@@ -233,7 +306,7 @@ async fn run_persist_coalesce(
     tracing::info!(lane, "persist coalesce stopped");
 }
 
-async fn run_persist_write_blocks(
+async fn run_blocks_write(
     mut rx: mpsc::Receiver<EncodedBatch>,
     blocks: Arc<Mutex<BlockStore>>,
     pending: Arc<AtomicU64>,
@@ -270,10 +343,10 @@ async fn run_persist_write_blocks(
             }
         }
     }
-    tracing::info!("persist write blocks stopped");
+    tracing::info!("persist blocks write stopped");
 }
 
-async fn run_persist_write_secondary(
+async fn run_history_write(
     mut rx: mpsc::Receiver<EncodedBatch>,
     state: Arc<Mutex<StateStore>>,
     pending: Arc<AtomicU64>,
@@ -288,7 +361,7 @@ async fn run_persist_write_secondary(
         let result = tokio::task::spawn_blocking(move || {
             let guard = state
                 .lock()
-                .map_err(|_| AppError::Internal("state sqlite mutex poisoned".into()))?;
+                .map_err(|_| AppError::Internal("history sqlite mutex poisoned".into()))?;
             guard.apply_encoded_state_batch(&ops)
         })
         .await;
@@ -300,15 +373,15 @@ async fn run_persist_write_secondary(
                 for id in &op_ids {
                     persist_timing().cancel(*id);
                 }
-                tracing::error!(error = %error, "persist secondary write failed");
+                tracing::error!(error = %error, "persist history write failed");
             }
             Err(error) => {
                 for id in &op_ids {
                     persist_timing().cancel(*id);
                 }
-                tracing::error!(error = %error, "persist secondary write join failed");
+                tracing::error!(error = %error, "persist history write join failed");
             }
         }
     }
-    tracing::info!("persist write secondary stopped");
+    tracing::info!("persist history write stopped");
 }

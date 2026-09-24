@@ -127,6 +127,7 @@ async fn get_book_by_name(
         &state.config.query_account,
         &spot_market,
         depth,
+        None,
     )
     .await
     {

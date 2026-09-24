@@ -297,7 +297,7 @@ async fn mark_cancelled(
 
     state
         .index
-        .update_order_cancelled(&spot_market, &chain_order_id)
+        .update_order_cancelled(&spot_market, &chain_order_id, None)
         .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -333,6 +333,7 @@ async fn index_from_event(
             &event,
             &spot_market,
             true,
+            None,
         )
         .await;
     }
@@ -342,6 +343,7 @@ async fn index_from_event(
         event,
         &spot_market,
         Some((request.status, request.filled_raw)),
+        None,
     )
     .await
     .ok_or_else(|| AppError::Internal("failed to index order from event".into()))?;

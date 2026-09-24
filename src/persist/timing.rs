@@ -30,7 +30,7 @@ pub enum PersistOpKind {
     Block,
     OrderHistory,
     ClosedBar,
-    Checkpoint,
+    IndexWrite,
 }
 
 impl fmt::Display for PersistOpKind {
@@ -39,7 +39,7 @@ impl fmt::Display for PersistOpKind {
             PersistOpKind::Block => "block",
             PersistOpKind::OrderHistory => "history",
             PersistOpKind::ClosedBar => "bar",
-            PersistOpKind::Checkpoint => "ckpt",
+            PersistOpKind::IndexWrite => "index",
         };
         write!(f, "{name}")
     }
@@ -51,7 +51,7 @@ impl PersistOpKind {
             PersistOp::SaveReceiptBlock(_) => PersistOpKind::Block,
             PersistOp::UpsertOrderHistory(_) => PersistOpKind::OrderHistory,
             PersistOp::SaveClosedBar(_) => PersistOpKind::ClosedBar,
-            PersistOp::Checkpoint { .. } => PersistOpKind::Checkpoint,
+            PersistOp::IndexWrite(_) => PersistOpKind::IndexWrite,
         }
     }
 }
@@ -59,7 +59,7 @@ impl PersistOpKind {
 pub fn block_num_of(op: &PersistOp) -> Option<u64> {
     match op {
         PersistOp::SaveReceiptBlock(block) => Some(block.block_num),
-        PersistOp::Checkpoint { block_num, .. } => Some(*block_num),
+        PersistOp::IndexWrite(ws) => Some(ws.block_num),
         _ => None,
     }
 }

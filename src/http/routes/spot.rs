@@ -63,6 +63,7 @@ async fn get_book(
         &state.config.query_account,
         &spot_market,
         depth,
+        None,
     )
     .await
     {

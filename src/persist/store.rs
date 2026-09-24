@@ -456,135 +456,62 @@ impl StateStore {
         Ok(())
     }
 
-    pub(crate) fn checkpoint_encoded(
-        &self,
-        encoded: &super::op::EncodedCheckpoint,
-    ) -> AppResult<()> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| AppError::Internal(format!("sqlite begin: {e}")))?;
+    pub(crate) fn write_meta(&self, block_num: u64, digest: &str) -> AppResult<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_block_num', ?1)",
+                params![block_num.to_string()],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite meta block: {e}")))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_digest', ?1)",
+                params![digest],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite meta digest: {e}")))?;
+        Ok(())
+    }
 
-        tx.execute("DELETE FROM markets", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear markets: {e}")))?;
-        tx.execute("DELETE FROM orders", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear orders: {e}")))?;
-        tx.execute("DELETE FROM last_trades", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear last_trades: {e}")))?;
-        tx.execute("DELETE FROM book_levels", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear book_levels: {e}")))?;
-        tx.execute("DELETE FROM book_meta", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear book_meta: {e}")))?;
-        tx.execute("DELETE FROM vaults", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear vaults: {e}")))?;
-        tx.execute("DELETE FROM vault_portfolio", [])
-            .map_err(|e| AppError::Internal(format!("sqlite clear vault_portfolio: {e}")))?;
-
-        {
-            let mut stmt = tx
-                .prepare("INSERT INTO markets (id, payload) VALUES (?1, ?2)")
-                .map_err(|e| AppError::Internal(format!("sqlite prepare markets: {e}")))?;
-            for (id, payload) in &encoded.markets {
-                stmt.execute(params![id, payload])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert market: {e}")))?;
+    /// Consistent file snapshot of live state DB (epoch checkpoint).
+    pub(crate) fn vacuum_into(&self, dest: &std::path::Path) -> AppResult<()> {
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AppError::Internal(format!("create ckpt dir {}: {e}", parent.display()))
+                })?;
             }
         }
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO orders
-                     (id, user_address, chain_order_id, spot_market, size_raw, filled_raw, status, payload)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare orders: {e}")))?;
-            for row in &encoded.orders {
-                stmt.execute(params![
-                    row.id,
-                    row.user_address,
-                    row.chain_order_id,
-                    row.spot_market,
-                    row.size_raw,
-                    row.filled_raw,
-                    row.status,
-                    row.payload,
-                ])
-                .map_err(|e| AppError::Internal(format!("sqlite insert order: {e}")))?;
-            }
+        if dest.exists() {
+            std::fs::remove_file(dest).map_err(|e| {
+                AppError::Internal(format!("remove existing ckpt {}: {e}", dest.display()))
+            })?;
         }
-        {
-            let mut stmt = tx
-                .prepare("INSERT INTO last_trades (spot_market, price_raw) VALUES (?1, ?2)")
-                .map_err(|e| AppError::Internal(format!("sqlite prepare last_trades: {e}")))?;
-            for (spot, price) in &encoded.last_trades {
-                stmt.execute(params![spot, price])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert last_trade: {e}")))?;
-            }
-        }
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO book_levels (spot_market, side, price_raw, size_raw)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare book_levels: {e}")))?;
-            for (spot, side, price, size) in &encoded.levels {
-                stmt.execute(params![spot, side, price, size])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert book_level: {e}")))?;
-            }
-        }
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO book_meta (spot_market, sequence, last_trade_price)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare book_meta: {e}")))?;
-            for (spot, sequence, last_trade_price) in &encoded.metas {
-                stmt.execute(params![spot, sequence, last_trade_price])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert book_meta: {e}")))?;
-            }
-        }
-        {
-            let mut stmt = tx
-                .prepare("INSERT INTO vaults (id, payload) VALUES (?1, ?2)")
-                .map_err(|e| AppError::Internal(format!("sqlite prepare vaults: {e}")))?;
-            for (id, payload) in &encoded.vaults {
-                stmt.execute(params![id, payload])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert vault: {e}")))?;
-            }
-        }
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO vault_portfolio (vault_id, spot_market, amount_raw)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare vault_portfolio: {e}")))?;
-            for (vault_id, spot, amount) in &encoded.vault_portfolio {
-                stmt.execute(params![vault_id, spot, amount])
-                    .map_err(|e| AppError::Internal(format!("sqlite insert vault_portfolio: {e}")))?;
-            }
-        }
-
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_block_num', ?1)",
-            params![encoded.block_num.to_string()],
-        )
-        .map_err(|e| AppError::Internal(format!("sqlite meta block: {e}")))?;
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_digest', ?1)",
-            params![encoded.digest],
-        )
-        .map_err(|e| AppError::Internal(format!("sqlite meta digest: {e}")))?;
-
-        tx.commit()
-            .map_err(|e| AppError::Internal(format!("sqlite commit checkpoint: {e}")))?;
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| AppError::Internal(format!("non-utf8 ckpt path {}", dest.display())))?;
+        let escaped = dest_str.replace('\'', "''");
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{escaped}';"))
+            .map_err(|e| {
+                AppError::Internal(format!("VACUUM INTO {}: {e}", dest.display()))
+            })?;
         Ok(())
     }
 
     pub(crate) fn apply_encoded_state_batch(
         &self,
         ops: &[super::op::EncodedPersistOp],
+    ) -> AppResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let refs: Vec<&super::op::EncodedPersistOp> = ops.iter().collect();
+        self.apply_simple_state_batch(&refs)
+    }
+
+    fn apply_simple_state_batch(
+        &self,
+        ops: &[&super::op::EncodedPersistOp],
     ) -> AppResult<()> {
         if ops.is_empty() {
             return Ok(());

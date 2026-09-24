@@ -23,6 +23,7 @@ pub async fn handle_subscribe(
         &state.config.query_account,
         spot_market,
         depth,
+        None,
     )
     .await
     {
