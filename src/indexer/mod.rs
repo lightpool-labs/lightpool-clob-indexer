@@ -7,13 +7,14 @@ mod processor;
 mod index_state;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use lightpool_sdk::{Message, ReceiptBlock, Subscription, WebSocketClient};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 pub use books::Books;
@@ -37,6 +38,14 @@ use processor::process_block;
 
 /// When apply backlog exceeds this, skip websocket fan-out to catch up faster.
 pub(crate) const QUIET_APPLY_BACKLOG: u64 = 8;
+/// Cap in-flight ReceiptBlocks between receive and decode.
+pub(crate) const PIPELINE_RAW_CAPACITY: usize = 64;
+/// Cap prepared blocks between decode and apply.
+pub(crate) const PIPELINE_PREPARED_CAPACITY: usize = 64;
+/// Cap WS NewBlocks before TCP/read backpressure.
+pub(crate) const WS_NEWBLOCKS_CAPACITY: usize = 128;
+/// Cap buffered live NewBlocks while downloading a peer checkpoint.
+pub(crate) const PEER_LIVE_BUFFER_MAX: usize = 256;
 
 pub type IndexApplyGate = Arc<Mutex<()>>;
 
@@ -57,6 +66,7 @@ pub struct IndexerSpawnConfig {
     pub persist: Option<SharedPersist>,
     pub apply_gate: Option<IndexApplyGate>,
     pub peer_catchup: Option<PeerCatchupConfig>,
+    pub checkpoint_notify: Option<CheckpointNotifier>,
 }
 
 pub fn new_apply_gate() -> IndexApplyGate {
@@ -75,6 +85,7 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
         persist,
         apply_gate,
         mut peer_catchup,
+        checkpoint_notify,
     } = cfg;
     tokio::spawn(async move {
         let mut first = true;
@@ -106,6 +117,7 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
                     persist.clone(),
                     apply_gate.clone(),
                     catchup,
+                    checkpoint_notify.clone(),
                     cancel.clone(),
                 ) => result,
             };
@@ -114,6 +126,9 @@ pub fn spawn(cfg: IndexerSpawnConfig, cancel: CancellationToken) -> JoinHandle<(
                 let mut state = head.write().await;
                 state.connected = false;
                 state.catching_up = false;
+            }
+            if let Some(persist) = &persist {
+                persist.set_secondary_persist(true);
             }
 
             if cancel.is_cancelled() {
@@ -153,18 +168,60 @@ pub fn spawn_bars_closer(index: SharedIndexState, cancel: CancellationToken) -> 
     })
 }
 
+/// Capacity-1 signal: apply path notifies when enough receipt blocks accumulated.
+#[derive(Clone)]
+pub struct CheckpointNotifier {
+    tx: mpsc::Sender<()>,
+    every_blocks: u64,
+    since_checkpoint: Arc<AtomicU64>,
+}
+
+impl CheckpointNotifier {
+    pub fn on_block_applied(&self, catching_up: bool) {
+        if catching_up || self.every_blocks == 0 {
+            return;
+        }
+        let n = self.since_checkpoint.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < self.every_blocks {
+            return;
+        }
+        // Coalesce: capacity-1 channel; if a request is already pending, keep counting.
+        if self.tx.try_send(()).is_ok() {
+            tracing::info!(
+                since_checkpoint = n,
+                every_blocks = self.every_blocks,
+                "checkpoint requested after applied blocks"
+            );
+        }
+    }
+
+    pub fn reset_after_checkpoint(&self) {
+        self.since_checkpoint.store(0, Ordering::Relaxed);
+    }
+}
+
+pub fn new_checkpoint_channel(every_blocks: u64) -> (CheckpointNotifier, mpsc::Receiver<()>) {
+    let (tx, rx) = mpsc::channel(1);
+    (
+        CheckpointNotifier {
+            tx,
+            every_blocks,
+            since_checkpoint: Arc::new(AtomicU64::new(0)),
+        },
+        rx,
+    )
+}
+
 pub fn spawn_checkpoint_worker(
-    interval_ms: u64,
+    mut rx: mpsc::Receiver<()>,
+    notifier: CheckpointNotifier,
     persist: SharedPersist,
     head: SharedIndexedBlockHead,
     index: SharedIndexState,
     apply_gate: IndexApplyGate,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
-    let period = Duration::from_millis(interval_ms.max(1));
     tokio::spawn(async move {
-        let mut ticker = interval(period);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_block_num = u64::MAX;
         let mut last_digest = String::new();
 
@@ -175,7 +232,12 @@ pub fn spawn_checkpoint_worker(
                     tracing::info!("checkpoint worker cancelled");
                     break;
                 }
-                _ = ticker.tick() => {}
+                msg = rx.recv() => {
+                    if msg.is_none() {
+                        tracing::info!("checkpoint notify channel closed");
+                        break;
+                    }
+                }
             }
 
             match checkpoint_once(
@@ -187,18 +249,25 @@ pub fn spawn_checkpoint_worker(
             )
             .await
             {
-                Ok(CheckpointOutcome::Skipped) => {}
+                Ok(CheckpointOutcome::Skipped) => {
+                    let catching_up = head.read().await.catching_up;
+                    if !catching_up {
+                        // Head unchanged; wait for another full window of applies.
+                        notifier.reset_after_checkpoint();
+                    }
+                }
                 Ok(CheckpointOutcome::Written { block_num, digest }) => {
-                    tracing::debug!(
+                    tracing::info!(
                         block_num,
                         digest = %digest,
-                        "periodic sqlite checkpoint completed"
+                        "block-triggered sqlite checkpoint completed"
                     );
                     last_block_num = block_num;
                     last_digest = digest;
+                    notifier.reset_after_checkpoint();
                 }
                 Err(error) => {
-                    tracing::error!(error = %error, "periodic sqlite checkpoint failed");
+                    tracing::error!(error = %error, "block-triggered sqlite checkpoint failed");
                 }
             }
         }
@@ -330,6 +399,7 @@ async fn run_once(
     persist: Option<SharedPersist>,
     apply_gate: Option<IndexApplyGate>,
     peer_catchup: Option<PeerCatchupConfig>,
+    checkpoint_notify: Option<CheckpointNotifier>,
     cancel: CancellationToken,
 ) -> AppResult<()> {
     if cancel.is_cancelled() {
@@ -355,7 +425,7 @@ async fn run_once(
         .await
         .map_err(|e| AppError::Internal(format!("create ws client: {e}")))?;
 
-    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let (sender, mut receiver) = mpsc::channel(WS_NEWBLOCKS_CAPACITY);
     let subscription_id = client
         .subscribe(Subscription::NewBlocks, sender)
         .await
@@ -402,6 +472,7 @@ async fn run_once(
             submit_wait: submit_wait.clone(),
             persist: persist.clone(),
             apply_gate: apply_gate.clone(),
+            checkpoint_notify,
             cancel: cancel.clone(),
         },
     )
@@ -409,7 +480,7 @@ async fn run_once(
 }
 
 async fn run_peer_catchup(
-    receiver: &mut mpsc::UnboundedReceiver<Message>,
+    receiver: &mut mpsc::Receiver<Message>,
     peer_cfg: &PeerCatchupConfig,
     chain: &SharedChainClient,
     query_account: &str,
@@ -457,6 +528,7 @@ async fn run_peer_catchup(
         let mut state = head.write().await;
         state.catching_up = true;
     }
+    persist.set_secondary_persist(false);
 
     let peer_url_download = peer_url.clone();
     let download = tokio::spawn(async move {
@@ -476,14 +548,26 @@ async fn run_peer_catchup(
             _ = cancel.cancelled() => {
                 let mut state = head.write().await;
                 state.catching_up = false;
+                persist.set_secondary_persist(true);
                 return Ok(());
             }
             msg = receiver.recv() => {
                 match msg {
-                    Some(Message::NewBlock(block)) => live_buffer.push(block),
+                    Some(Message::NewBlock(block)) => {
+                        if live_buffer.len() >= PEER_LIVE_BUFFER_MAX {
+                            let _ = live_buffer.remove(0);
+                            tracing::warn!(
+                                buffered = live_buffer.len() + 1,
+                                limit = PEER_LIVE_BUFFER_MAX,
+                                "peer catch-up live buffer full; dropping oldest NewBlock"
+                            );
+                        }
+                        live_buffer.push(block);
+                    }
                     Some(Message::Error(err)) => {
                         let mut state = head.write().await;
                         state.catching_up = false;
+                        persist.set_secondary_persist(true);
                         return Err(AppError::Internal(format!(
                             "ws error during peer catch-up: {err}"
                         )));
@@ -492,6 +576,7 @@ async fn run_peer_catchup(
                     None => {
                         let mut state = head.write().await;
                         state.catching_up = false;
+                        persist.set_secondary_persist(true);
                         return Err(AppError::Internal(
                             "ws closed during peer catch-up".into(),
                         ));
@@ -504,11 +589,13 @@ async fn run_peer_catchup(
                     Ok(Err(error)) => {
                         let mut state = head.write().await;
                         state.catching_up = false;
+                        persist.set_secondary_persist(true);
                         return Err(error);
                     }
                     Err(error) => {
                         let mut state = head.write().await;
                         state.catching_up = false;
+                        persist.set_secondary_persist(true);
                         return Err(AppError::Internal(format!(
                             "peer download join: {error}"
                         )));
@@ -572,7 +659,7 @@ async fn run_peer_catchup(
             }
             let block_num = block.block_num;
             let tx_count = block.transaction_outputs.len();
-            persist.enqueue_receipt_block(block.clone());
+            persist.enqueue_receipt_block(&block).await;
             process_block(
                 chain,
                 query_account,
@@ -604,6 +691,7 @@ async fn run_peer_catchup(
             state.digest = tip.digest;
             state.catching_up = false;
         }
+        persist.set_secondary_persist(true);
     }
 
     let finished_tip = head.read().await.block_num;

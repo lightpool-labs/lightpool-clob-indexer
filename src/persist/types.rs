@@ -6,7 +6,14 @@ use crate::domain::{Market, Order, Vault};
 
 pub const ORDER_HISTORY_LIMIT: usize = 2000;
 pub const BAR_HISTORY_LIMIT: usize = 5000;
-pub const DEFAULT_PERSIST_WORKERS: usize = 4;
+pub(crate) const DEFAULT_PERSIST_BATCH_MAX: usize = 128;
+pub(crate) const DEFAULT_PERSIST_BATCH_WAIT_MS: u64 = 2;
+/// Ingress queue holds cloned blocks (~MBs); keep this small.
+pub(crate) const DEFAULT_PERSIST_QUEUE_CAPACITY: usize = 64;
+/// Parallel encode workers (bincode / json) before the single sqlite writer.
+pub(crate) const DEFAULT_PERSIST_ENCODE_WORKERS: usize = 4;
+/// Drop order-history / bars when persist backlog exceeds this.
+pub(crate) const SECONDARY_PENDING_LIMIT: u64 = 128;
 
 #[derive(Debug, Clone)]
 pub struct ClosedBarRow {

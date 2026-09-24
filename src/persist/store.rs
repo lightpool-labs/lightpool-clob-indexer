@@ -13,11 +13,170 @@ use super::types::{
     PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, ORDER_HISTORY_LIMIT,
 };
 
-pub(crate) struct PersistStore {
+pub(crate) struct BlockStore {
     pub(crate) conn: Connection,
 }
 
-impl PersistStore {
+pub(crate) struct StateStore {
+    pub(crate) conn: Connection,
+}
+
+impl BlockStore {
+    pub(crate) fn migrate(&self) -> AppResult<()> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS blocks (
+                    block_num INTEGER PRIMARY KEY NOT NULL,
+                    digest TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    saved_at_ms INTEGER NOT NULL
+                );
+                ",
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite migrate blocks: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_blocks_through(&self, block_num: u64) -> AppResult<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM blocks WHERE block_num <= ?1",
+                params![block_num as i64],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite truncate blocks: {e}")))?;
+        Ok(deleted)
+    }
+
+    pub(crate) fn save_block(&self, block_num: u64, digest: &str, payload: &[u8]) -> AppResult<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO blocks (block_num, digest, payload, saved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![block_num as i64, digest, payload, now_ms],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite save_block: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn load_blocks_after(
+        &self,
+        after_block_num: Option<u64>,
+        limit: Option<usize>,
+    ) -> AppResult<Vec<(u64, String, Vec<u8>)>> {
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(u64, String, Vec<u8>)> {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        };
+
+        let mut out = Vec::new();
+        if let Some(n) = after_block_num {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_num, digest, payload FROM blocks
+                     WHERE block_num > ?1
+                     ORDER BY block_num ASC, saved_at_ms ASC",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare blocks: {e}")))?;
+            let rows = stmt
+                .query_map(params![n as i64], map_row)
+                .map_err(|e| AppError::Internal(format!("sqlite query blocks: {e}")))?;
+            for row in rows {
+                out.push(row.map_err(|e| AppError::Internal(format!("sqlite blocks row: {e}")))?);
+                if limit.is_some_and(|lim| out.len() >= lim) {
+                    break;
+                }
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT block_num, digest, payload FROM blocks
+                     ORDER BY block_num ASC, saved_at_ms ASC",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare blocks: {e}")))?;
+            let rows = stmt
+                .query_map([], map_row)
+                .map_err(|e| AppError::Internal(format!("sqlite query blocks: {e}")))?;
+            for row in rows {
+                out.push(row.map_err(|e| AppError::Internal(format!("sqlite blocks row: {e}")))?);
+                if limit.is_some_and(|lim| out.len() >= lim) {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM blocks WHERE block_num > ?1",
+                params![after_block_num as i64],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite delete blocks after: {e}")))?;
+        Ok(deleted)
+    }
+
+    pub(crate) fn apply_encoded_blocks_batch(
+        &self,
+        ops: &[super::op::EncodedPersistOp],
+    ) -> AppResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("sqlite begin blocks batch: {e}")))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO blocks (block_num, digest, payload, saved_at_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare blocks batch: {e}")))?;
+            for op in ops {
+                match op {
+                    super::op::EncodedPersistOp::SaveBlockBytes {
+                        block_num,
+                        digest,
+                        payload,
+                    } => {
+                        stmt.execute(params![*block_num as i64, digest, payload, now_ms])
+                            .map_err(|e| {
+                                AppError::Internal(format!("sqlite batch save_block: {e}"))
+                            })?;
+                    }
+                    _ => {
+                        return Err(AppError::Internal(
+                            "non-block op in blocks batch".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("sqlite commit blocks batch: {e}")))?;
+        Ok(())
+    }
+}
+
+impl StateStore {
     pub(crate) fn migrate(&self) -> AppResult<()> {
         self.conn
             .execute_batch(
@@ -25,13 +184,6 @@ impl PersistStore {
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS blocks (
-                    block_num INTEGER PRIMARY KEY NOT NULL,
-                    digest TEXT NOT NULL,
-                    payload BLOB NOT NULL,
-                    saved_at_ms INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS markets (
@@ -114,7 +266,7 @@ impl PersistStore {
                     ON order_history(user_address, status_ts_ms DESC);
                 ",
             )
-            .map_err(|e| AppError::Internal(format!("sqlite migrate: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("sqlite migrate state: {e}")))?;
         Ok(())
     }
 
@@ -143,85 +295,6 @@ impl PersistStore {
             .parse()
             .map_err(|e| AppError::Internal(format!("sqlite meta block_num: {e}")))?;
         Ok(Some(PersistMeta { block_num, digest }))
-    }
-
-    pub(crate) fn save_block(&self, block_num: u64, digest: &str, payload: &[u8]) -> AppResult<()> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO blocks (block_num, digest, payload, saved_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![block_num as i64, digest, payload, now_ms],
-            )
-            .map_err(|e| AppError::Internal(format!("sqlite save_block: {e}")))?;
-        Ok(())
-    }
-
-    pub(crate) fn load_blocks_after(
-        &self,
-        after_block_num: Option<u64>,
-        limit: Option<usize>,
-    ) -> AppResult<Vec<(u64, String, Vec<u8>)>> {
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(u64, String, Vec<u8>)> {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        };
-
-        let mut out = Vec::new();
-        if let Some(n) = after_block_num {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT block_num, digest, payload FROM blocks
-                     WHERE block_num > ?1
-                     ORDER BY block_num ASC, saved_at_ms ASC",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare blocks: {e}")))?;
-            let rows = stmt
-                .query_map(params![n as i64], map_row)
-                .map_err(|e| AppError::Internal(format!("sqlite query blocks: {e}")))?;
-            for row in rows {
-                out.push(row.map_err(|e| AppError::Internal(format!("sqlite blocks row: {e}")))?);
-                if limit.is_some_and(|lim| out.len() >= lim) {
-                    break;
-                }
-            }
-        } else {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT block_num, digest, payload FROM blocks
-                     ORDER BY block_num ASC, saved_at_ms ASC",
-                )
-                .map_err(|e| AppError::Internal(format!("sqlite prepare blocks: {e}")))?;
-            let rows = stmt
-                .query_map([], map_row)
-                .map_err(|e| AppError::Internal(format!("sqlite query blocks: {e}")))?;
-            for row in rows {
-                out.push(row.map_err(|e| AppError::Internal(format!("sqlite blocks row: {e}")))?);
-                if limit.is_some_and(|lim| out.len() >= lim) {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    pub(crate) fn delete_blocks_after(&self, after_block_num: u64) -> AppResult<usize> {
-        let deleted = self
-            .conn
-            .execute(
-                "DELETE FROM blocks WHERE block_num > ?1",
-                params![after_block_num as i64],
-            )
-            .map_err(|e| AppError::Internal(format!("sqlite delete blocks after: {e}")))?;
-        Ok(deleted)
     }
 
     pub(crate) fn checkpoint(
@@ -380,6 +453,236 @@ impl PersistStore {
 
         tx.commit()
             .map_err(|e| AppError::Internal(format!("sqlite commit checkpoint: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint_encoded(
+        &self,
+        encoded: &super::op::EncodedCheckpoint,
+    ) -> AppResult<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("sqlite begin: {e}")))?;
+
+        tx.execute("DELETE FROM markets", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear markets: {e}")))?;
+        tx.execute("DELETE FROM orders", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear orders: {e}")))?;
+        tx.execute("DELETE FROM last_trades", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear last_trades: {e}")))?;
+        tx.execute("DELETE FROM book_levels", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear book_levels: {e}")))?;
+        tx.execute("DELETE FROM book_meta", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear book_meta: {e}")))?;
+        tx.execute("DELETE FROM vaults", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear vaults: {e}")))?;
+        tx.execute("DELETE FROM vault_portfolio", [])
+            .map_err(|e| AppError::Internal(format!("sqlite clear vault_portfolio: {e}")))?;
+
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO markets (id, payload) VALUES (?1, ?2)")
+                .map_err(|e| AppError::Internal(format!("sqlite prepare markets: {e}")))?;
+            for (id, payload) in &encoded.markets {
+                stmt.execute(params![id, payload])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert market: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO orders
+                     (id, user_address, chain_order_id, spot_market, size_raw, filled_raw, status, payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare orders: {e}")))?;
+            for row in &encoded.orders {
+                stmt.execute(params![
+                    row.id,
+                    row.user_address,
+                    row.chain_order_id,
+                    row.spot_market,
+                    row.size_raw,
+                    row.filled_raw,
+                    row.status,
+                    row.payload,
+                ])
+                .map_err(|e| AppError::Internal(format!("sqlite insert order: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO last_trades (spot_market, price_raw) VALUES (?1, ?2)")
+                .map_err(|e| AppError::Internal(format!("sqlite prepare last_trades: {e}")))?;
+            for (spot, price) in &encoded.last_trades {
+                stmt.execute(params![spot, price])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert last_trade: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO book_levels (spot_market, side, price_raw, size_raw)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare book_levels: {e}")))?;
+            for (spot, side, price, size) in &encoded.levels {
+                stmt.execute(params![spot, side, price, size])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert book_level: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO book_meta (spot_market, sequence, last_trade_price)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare book_meta: {e}")))?;
+            for (spot, sequence, last_trade_price) in &encoded.metas {
+                stmt.execute(params![spot, sequence, last_trade_price])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert book_meta: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO vaults (id, payload) VALUES (?1, ?2)")
+                .map_err(|e| AppError::Internal(format!("sqlite prepare vaults: {e}")))?;
+            for (id, payload) in &encoded.vaults {
+                stmt.execute(params![id, payload])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert vault: {e}")))?;
+            }
+        }
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO vault_portfolio (vault_id, spot_market, amount_raw)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare vault_portfolio: {e}")))?;
+            for (vault_id, spot, amount) in &encoded.vault_portfolio {
+                stmt.execute(params![vault_id, spot, amount])
+                    .map_err(|e| AppError::Internal(format!("sqlite insert vault_portfolio: {e}")))?;
+            }
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_block_num', ?1)",
+            params![encoded.block_num.to_string()],
+        )
+        .map_err(|e| AppError::Internal(format!("sqlite meta block: {e}")))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_digest', ?1)",
+            params![encoded.digest],
+        )
+        .map_err(|e| AppError::Internal(format!("sqlite meta digest: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("sqlite commit checkpoint: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_encoded_state_batch(
+        &self,
+        ops: &[super::op::EncodedPersistOp],
+    ) -> AppResult<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| AppError::Internal(format!("sqlite begin state batch: {e}")))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        {
+            let mut history_stmt = tx
+                .prepare(
+                    "INSERT INTO order_history
+                     (id, user_address, chain_order_id, spot_market, size_raw, filled_raw, status, payload, status_ts_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(id) DO UPDATE SET
+                       user_address = excluded.user_address,
+                       chain_order_id = excluded.chain_order_id,
+                       spot_market = excluded.spot_market,
+                       size_raw = excluded.size_raw,
+                       filled_raw = excluded.filled_raw,
+                       status = excluded.status,
+                       payload = excluded.payload,
+                       status_ts_ms = excluded.status_ts_ms",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare history batch: {e}")))?;
+            let mut bar_stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO bars
+                     (spot_market, interval, start_ts, open_raw, high_raw, low_raw, close_raw, volume_raw, trade_count)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .map_err(|e| AppError::Internal(format!("sqlite prepare bars batch: {e}")))?;
+
+            for op in ops {
+                match op {
+                    super::op::EncodedPersistOp::UpsertOrderHistory {
+                        order_id,
+                        user_address,
+                        chain_order_id,
+                        spot_market,
+                        size_raw,
+                        filled_raw,
+                        status,
+                        payload,
+                    } => {
+                        history_stmt
+                            .execute(params![
+                                order_id,
+                                user_address,
+                                chain_order_id,
+                                spot_market,
+                                size_raw,
+                                filled_raw,
+                                status,
+                                payload,
+                                now_ms,
+                            ])
+                            .map_err(|e| {
+                                AppError::Internal(format!("sqlite batch order_history: {e}"))
+                            })?;
+                    }
+                    super::op::EncodedPersistOp::SaveClosedBar(bar) => {
+                        bar_stmt
+                            .execute(params![
+                                normalize_spot_market_key(&bar.spot_market),
+                                bar.interval,
+                                bar.start_ts as i64,
+                                bar.open_raw as i64,
+                                bar.high_raw as i64,
+                                bar.low_raw as i64,
+                                bar.close_raw as i64,
+                                bar.volume_raw as i64,
+                                bar.trade_count as i64,
+                            ])
+                            .map_err(|e| {
+                                AppError::Internal(format!("sqlite batch save_bar: {e}"))
+                            })?;
+                    }
+                    super::op::EncodedPersistOp::SaveBlockBytes { .. } => {
+                        return Err(AppError::Internal(
+                            "block op in secondary state batch".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| AppError::Internal(format!("sqlite commit state batch: {e}")))?;
+
+        for op in ops {
+            if let super::op::EncodedPersistOp::SaveClosedBar(bar) = op {
+                self.trim_bars(&bar.spot_market, &bar.interval, BAR_HISTORY_LIMIT)?;
+            }
+        }
         Ok(())
     }
 
@@ -573,9 +876,7 @@ impl PersistStore {
         }
         Ok(out)
     }
-}
 
-impl PersistStore {
     pub(crate) fn save_closed_bar(&self, bar: &ClosedBarRow) -> AppResult<()> {
         self.conn
             .execute(

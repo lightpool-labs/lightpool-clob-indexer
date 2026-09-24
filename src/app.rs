@@ -106,8 +106,8 @@ impl App {
         }
 
         if let Some(workers) = self.persist_workers.take() {
-            for (i, handle) in workers.spawn().into_iter().enumerate() {
-                self.background.push(format!("persist_{i}"), handle);
+            for (name, handle) in workers.spawn() {
+                self.background.push(name, handle);
             }
         }
 
@@ -126,37 +126,16 @@ impl App {
             })
         };
 
-        self.background.push(
-            "indexer",
-            indexer::spawn(
-                IndexerSpawnConfig {
-                    ws_url: config.lightpool_ws_url.clone(),
-                    chain: self.state.chain.clone(),
-                    query_account: config.query_account.clone(),
-                    head: self.state.indexed_head.clone(),
-                    index: self.state.index.clone(),
-                    user_hub: self.state.user_hub.clone(),
-                    submit_wait: self.state.submit_wait.clone(),
-                    persist: self.state.persist.clone(),
-                    apply_gate: self.apply_gate.clone(),
-                    peer_catchup,
-                },
-                self.cancel.clone(),
-            ),
-        );
-
-        self.background.push(
-            "bars_closer",
-            indexer::spawn_bars_closer(self.state.index.clone(), self.cancel.clone()),
-        );
-
         if let (Some(persist), Some(apply_gate)) =
             (self.state.persist.clone(), self.apply_gate.clone())
         {
+            let (ckpt_notify, ckpt_rx) =
+                indexer::new_checkpoint_channel(config.checkpoint_every_blocks);
             self.background.push(
                 "checkpoint",
                 indexer::spawn_checkpoint_worker(
-                    config.checkpoint_interval_ms,
+                    ckpt_rx,
+                    ckpt_notify.clone(),
                     persist,
                     self.state.indexed_head.clone(),
                     self.state.index.clone(),
@@ -164,7 +143,52 @@ impl App {
                     self.cancel.clone(),
                 ),
             );
+
+            self.background.push(
+                "indexer",
+                indexer::spawn(
+                    IndexerSpawnConfig {
+                        ws_url: config.lightpool_ws_url.clone(),
+                        chain: self.state.chain.clone(),
+                        query_account: config.query_account.clone(),
+                        head: self.state.indexed_head.clone(),
+                        index: self.state.index.clone(),
+                        user_hub: self.state.user_hub.clone(),
+                        submit_wait: self.state.submit_wait.clone(),
+                        persist: self.state.persist.clone(),
+                        apply_gate: self.apply_gate.clone(),
+                        peer_catchup,
+                        checkpoint_notify: Some(ckpt_notify),
+                    },
+                    self.cancel.clone(),
+                ),
+            );
+        } else {
+            self.background.push(
+                "indexer",
+                indexer::spawn(
+                    IndexerSpawnConfig {
+                        ws_url: config.lightpool_ws_url.clone(),
+                        chain: self.state.chain.clone(),
+                        query_account: config.query_account.clone(),
+                        head: self.state.indexed_head.clone(),
+                        index: self.state.index.clone(),
+                        user_hub: self.state.user_hub.clone(),
+                        submit_wait: self.state.submit_wait.clone(),
+                        persist: self.state.persist.clone(),
+                        apply_gate: self.apply_gate.clone(),
+                        peer_catchup,
+                        checkpoint_notify: None,
+                    },
+                    self.cancel.clone(),
+                ),
+            );
         }
+
+        self.background.push(
+            "bars_closer",
+            indexer::spawn_bars_closer(self.state.index.clone(), self.cancel.clone()),
+        );
     }
 
     pub async fn serve(mut self) {

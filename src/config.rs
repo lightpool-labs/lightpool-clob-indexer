@@ -28,13 +28,12 @@ pub struct Config {
     pub sqlite_path: PathBuf,
     /// When false, skip sqlite open/recover/checkpoint/block/bar/order-history writes.
     pub enable_sqlite: bool,
-    pub checkpoint_interval_ms: u64,
+    /// Persist a sqlite checkpoint after this many applied receipt blocks.
+    pub checkpoint_every_blocks: u64,
     /// Peer clob-index base URLs (e.g. http://127.0.0.1:3003) for historic catch-up.
     pub peer_index_urls: Vec<String>,
     /// Catch up from a peer when peer tip is at least this many block_nums ahead.
     pub peer_catchup_threshold: u64,
-    /// Background sqlite writer tasks (unified PersistOp queue).
-    pub persist_workers: usize,
 }
 
 impl Config {
@@ -75,7 +74,7 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| crate::persist::default_sqlite_path()),
             enable_sqlite,
-            checkpoint_interval_ms: env::var("CHECKPOINT_INTERVAL_MS")
+            checkpoint_every_blocks: env::var("CHECKPOINT_EVERY_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1_000),
@@ -93,10 +92,6 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(50),
-            persist_workers: env::var("PERSIST_WORKERS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(crate::persist::DEFAULT_PERSIST_WORKERS),
         }
     }
 }

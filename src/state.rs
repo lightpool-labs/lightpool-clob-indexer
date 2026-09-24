@@ -46,8 +46,7 @@ impl AppState {
 
         let (persist, persist_workers) = if config.enable_sqlite {
             let (persist, workers) =
-                SharedPersist::open(&config.sqlite_path, config.persist_workers)
-                    .expect("failed to open SQLITE_PATH");
+                SharedPersist::open(&config.sqlite_path).expect("failed to open SQLITE_PATH");
             (Some(persist), Some(workers))
         } else {
             (None, None)

@@ -5,6 +5,8 @@
 //! 1. receive  — pull WS messages, enqueue blocks only
 //! 2. decode   — prepare/classify (parse event payloads, group by market)
 //! 3. apply    — ordered by block; within a block, markets apply in parallel
+//!
+//! All stage channels are bounded so a slow persist/apply cannot unbounded-grow RAM.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,7 +24,10 @@ use crate::ws::process::SharedUserEventHub;
 
 use super::processor::{prepare_block, process_prepared_block, ProcessOpts, PreparedBlock};
 use super::index_state::{SharedIndexState, SharedIndexedBlockHead};
-use super::{IndexApplyGate, QUIET_APPLY_BACKLOG};
+use super::{
+    CheckpointNotifier, IndexApplyGate, PIPELINE_PREPARED_CAPACITY, PIPELINE_RAW_CAPACITY,
+    QUIET_APPLY_BACKLOG,
+};
 
 pub struct LivePipelineConfig {
     pub chain: SharedChainClient,
@@ -33,16 +38,17 @@ pub struct LivePipelineConfig {
     pub submit_wait: SharedSubmitWaitRegistry,
     pub persist: Option<SharedPersist>,
     pub apply_gate: Option<IndexApplyGate>,
+    pub checkpoint_notify: Option<CheckpointNotifier>,
     pub cancel: CancellationToken,
 }
 
 /// Run receive → decode → apply until cancel or WS ends.
 pub async fn run_live_pipeline(
-    mut ws_rx: mpsc::UnboundedReceiver<Message>,
+    mut ws_rx: mpsc::Receiver<Message>,
     cfg: LivePipelineConfig,
 ) -> AppResult<()> {
-    let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<ReceiptBlock>();
-    let (prepared_tx, mut prepared_rx) = mpsc::unbounded_channel::<PreparedBlock>();
+    let (raw_tx, mut raw_rx) = mpsc::channel::<ReceiptBlock>(PIPELINE_RAW_CAPACITY);
+    let (prepared_tx, mut prepared_rx) = mpsc::channel::<PreparedBlock>(PIPELINE_PREPARED_CAPACITY);
     let decode_backlog = Arc::new(AtomicU64::new(0));
     let apply_backlog = Arc::new(AtomicU64::new(0));
 
@@ -57,7 +63,7 @@ pub async fn run_live_pipeline(
                     match message {
                         Some(Message::NewBlock(block)) => {
                             decode_backlog_recv.fetch_add(1, Ordering::Relaxed);
-                            if raw_tx.send(block).is_err() {
+                            if raw_tx.send(block).await.is_err() {
                                 decode_backlog_recv.fetch_sub(1, Ordering::Relaxed);
                                 return Ok(());
                             }
@@ -86,12 +92,13 @@ pub async fn run_live_pipeline(
             decode_backlog_dec.fetch_sub(1, Ordering::Relaxed);
 
             if let Some(persist) = persist_decode.as_ref() {
-                persist.enqueue_receipt_block(block.clone());
+                // Awaits when persist queue is full → backpressure into raw/WS.
+                persist.enqueue_receipt_block(&block).await;
             }
 
             let prepared = prepare_block(&index_decode, block).await;
             apply_backlog_enc.fetch_add(1, Ordering::Relaxed);
-            if prepared_tx.send(prepared).is_err() {
+            if prepared_tx.send(prepared).await.is_err() {
                 apply_backlog_enc.fetch_sub(1, Ordering::Relaxed);
                 break;
             }
@@ -107,6 +114,8 @@ pub async fn run_live_pipeline(
     let apply_hub = cfg.user_hub.clone();
     let apply_wait = cfg.submit_wait.clone();
     let apply_gate = cfg.apply_gate.clone();
+    let persist_apply = cfg.persist.clone();
+    let checkpoint_notify = cfg.checkpoint_notify.clone();
     let apply_worker = tokio::spawn(async move {
         while let Some(prepared) = prepared_rx.recv().await {
             if cancel_apply.is_cancelled() {
@@ -117,6 +126,9 @@ pub async fn run_live_pipeline(
                 .saturating_sub(1);
             let catching_up = apply_head.read().await.catching_up;
             let quiet = catching_up || remaining >= QUIET_APPLY_BACKLOG;
+            if let Some(persist) = persist_apply.as_ref() {
+                persist.set_secondary_persist(!quiet);
+            }
             if quiet && remaining > 0 && remaining.is_multiple_of(50) {
                 tracing::warn!(
                     apply_backlog = remaining + 1,
@@ -158,6 +170,10 @@ pub async fn run_live_pipeline(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
+            }
+
+            if let Some(notify) = checkpoint_notify.as_ref() {
+                notify.on_block_applied(catching_up);
             }
         }
     });
