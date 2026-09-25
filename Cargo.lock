@@ -2298,16 +2298,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightpool-macros"
-version = "0.1.0"
-dependencies = [
- "futures",
- "once_cell",
- "paste",
- "tracing",
-]
-
-[[package]]
 name = "lightpool-sdk"
 version = "0.5.0"
 dependencies = [
@@ -4320,6 +4310,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-macros"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "once_cell",
+ "paste",
+ "tracing",
+]
+
+[[package]]
 name = "typed-store"
 version = "0.6.0"
 dependencies = [
@@ -4331,7 +4331,6 @@ dependencies = [
  "fdlimit",
  "hdrhistogram",
  "itertools 0.10.5",
- "lightpool-macros",
  "once_cell",
  "prometheus",
  "rand 0.7.3",
@@ -4344,6 +4343,7 @@ dependencies = [
  "tidehunter",
  "tokio",
  "tracing",
+ "typed-macros",
  "typed-store-derive",
  "typed-store-error",
  "uint",

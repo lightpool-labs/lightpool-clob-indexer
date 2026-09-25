@@ -42,6 +42,9 @@ pub struct PersistOrderRow {
     pub spot_market: String,
     pub size_raw: u64,
     pub filled_raw: u64,
+    /// Wall-clock ms when the order entered history (filled/cancelled). 0 if unknown.
+    #[serde(default)]
+    pub status_ts_ms: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

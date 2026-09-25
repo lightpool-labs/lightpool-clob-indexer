@@ -9,8 +9,8 @@ use lightpool_sdk::event_contract_events::{
     EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
-    MarketCreatedEvent, OrderCancelledEvent, OrderCreatedEvent, OrderEventType, OrderFilledEvent,
-    OrderUpdatedEvent, parse_spot_event_data,
+    MarketCreatedEvent, MarketOrderExecutedEvent, OrderCancelledEvent, OrderCreatedEvent,
+    OrderEventType, OrderFilledEvent, OrderUpdatedEvent, parse_spot_event_data,
 };
 use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
@@ -82,6 +82,8 @@ pub enum MarketOrderEvent {
         filled: OrderFilledEvent,
         tx_sender: String,
     },
+    /// Taker market order summary (chain never emits `order_created` for market orders).
+    Executed(MarketOrderExecutedEvent),
 }
 
 #[derive(Debug)]
@@ -185,6 +187,16 @@ pub async fn prepare_block(store: &SharedIndexState, block: ReceiptBlock) -> Pre
                         );
                     }
                 }
+                "market_order_executed" => {
+                    if let Ok(executed) = bincode::deserialize::<MarketOrderExecutedEvent>(data) {
+                        if let Some(spot_market) = spot_market_from_event_contract(event) {
+                            markets
+                                .entry(spot_market)
+                                .or_default()
+                                .push(MarketOrderEvent::Executed(executed));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -249,6 +261,8 @@ pub async fn process_prepared_block(
     let unmapped = prepared.unmapped;
     let block = prepared.block;
 
+    store.set_indexing_block_timestamp(block.timestamp);
+
     for tx_result in &block.transaction_outputs {
         let digest = hex::encode(tx_result.signed_digest.as_bytes());
         if !submit_wait.complete(&digest, block_num, &tx_result.receipt) {
@@ -271,7 +285,11 @@ pub async fn process_prepared_block(
             };
             if matches!(
                 action_name.as_str(),
-                "order_created" | "order_cancelled" | "order_updated" | "order_filled"
+                "order_created"
+                    | "order_cancelled"
+                    | "order_updated"
+                    | "order_filled"
+                    | "market_order_executed"
             ) {
                 continue;
             }
@@ -664,6 +682,14 @@ async fn apply_market_order_events(
                         filled.price,
                         opts.publish_ws,
                         Some(&mut ws),
+                        {
+                            let ms = store.indexing_block_timestamp_ms();
+                            if ms > 0 {
+                                Some(ms)
+                            } else {
+                                None
+                            }
+                        },
                     )
                     .await;
                 store
@@ -706,6 +732,69 @@ async fn apply_market_order_events(
                         tx_sender,
                     )
                     .await;
+                }
+            }
+            MarketOrderEvent::Executed(executed) => {
+                let chain_order_id = executed.order_id.to_string();
+                // Market orders never emit `order_created`; this event archives the taker.
+                if store.has_chain_order(spot_market, &chain_order_id).await {
+                    tracing::debug!(
+                        block_num,
+                        order_id = %chain_order_id,
+                        spot_market,
+                        "market_order_executed skipped; order already hot-indexed"
+                    );
+                    continue;
+                }
+                let filled_amount = executed.filled_amount;
+                let remaining = executed.amount.saturating_sub(filled_amount);
+                let is_fully_filled = filled_amount > 0 && remaining == 0;
+                let Some(order) = index_market_order_executed(
+                    store,
+                    executed.clone(),
+                    spot_market,
+                    Some(&mut ws),
+                )
+                .await
+                else {
+                    continue;
+                };
+                if opts.publish_ws {
+                    let user_address = executed.creator.to_string();
+                    user_hub
+                        .publish_order(
+                            "update",
+                            &user_address,
+                            &chain_order_id,
+                            spot_market,
+                            order.clone(),
+                            block_num,
+                        )
+                        .await;
+                    if filled_amount > 0 {
+                        let side_str = match executed.side {
+                            lightpool_sdk::OrderSide::Buy => "buy",
+                            lightpool_sdk::OrderSide::Sell => "sell",
+                        };
+                        let price_raw = executed.avg_filled_price.unwrap_or(0);
+                        user_hub
+                            .publish_trade(
+                                &user_address,
+                                &chain_order_id,
+                                order.id,
+                                &order.market_slug,
+                                &order.outcome,
+                                side_str,
+                                &format_price_pieces(price_raw),
+                                &format_token_amount(filled_amount),
+                                &format_token_amount(remaining),
+                                is_fully_filled,
+                                spot_market,
+                                block_num,
+                                None,
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -937,6 +1026,19 @@ fn format_event_detail(event: &TransactionEvent) -> String {
                     format_token_amount(e.fill_amount),
                     format_token_amount(e.remaining_amount),
                     e.market,
+                );
+            }
+        }
+        "market_order_executed" => {
+            if let Ok(e) = bincode::deserialize::<MarketOrderExecutedEvent>(bytes) {
+                return format!(
+                    "market_order_executed: id={} side={:?} amount={} filled={} avg_price={:?} creator={}",
+                    e.order_id,
+                    e.side,
+                    format_token_amount(e.amount),
+                    format_token_amount(e.filled_amount),
+                    e.avg_filled_price.map(format_price_pieces),
+                    e.creator,
                 );
             }
         }
@@ -1219,6 +1321,91 @@ pub async fn index_order_created(
             chain_order_id,
             created.amount,
             filled_raw,
+            ws,
+        )
+        .await;
+
+    Some(order)
+}
+
+/// Archive a taker market order from `market_order_executed` (no prior `order_created`).
+pub async fn index_market_order_executed(
+    store: &SharedIndexState,
+    executed: MarketOrderExecutedEvent,
+    spot_market: &str,
+    ws: Option<&mut IndexWriteSet>,
+) -> Option<Order> {
+    let (market_id, outcome) = match store.lookup_spot_market(spot_market).await {
+        Some(mapped) => mapped,
+        None => {
+            tracing::debug!(
+                spot_market,
+                order_id = %executed.order_id,
+                "market_order_executed for standalone spot market; registering for order index"
+            );
+            store.ensure_standalone_spot_market(spot_market).await
+        }
+    };
+
+    let status = if executed.filled_amount == 0 {
+        "cancelled"
+    } else if executed.filled_amount >= executed.amount {
+        "filled"
+    } else {
+        // Remaining size is cancelled on chain for market orders.
+        "cancelled"
+    };
+
+    let side = match executed.side {
+        lightpool_sdk::OrderSide::Buy => "buy",
+        lightpool_sdk::OrderSide::Sell => "sell",
+    };
+    let chain_order_id = executed.order_id.to_string();
+    let (question, market_slug) = match store.get_market(market_id).await {
+        Some(market) => (
+            market.label().to_string(),
+            if !market.slug().is_empty() {
+                market.slug().to_string()
+            } else {
+                market.name().to_string()
+            },
+        ),
+        None => (String::new(), String::new()),
+    };
+    let normalized_spot = crate::spot_market::normalize_spot_market_key(spot_market);
+    let price_raw = executed.avg_filled_price.unwrap_or(0);
+    let order = Order {
+        id: Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{normalized_spot}:{chain_order_id}").as_bytes(),
+        ),
+        market_id,
+        market_slug,
+        question,
+        outcome,
+        side: side.into(),
+        price: format_price_pieces(price_raw),
+        size: format_token_amount(executed.amount),
+        status: status.into(),
+        cloid: None,
+    };
+
+    tracing::debug!(
+        order_id = chain_order_id,
+        market_id = %market_id,
+        user = %executed.creator,
+        filled = executed.filled_amount,
+        "indexed market_order_executed"
+    );
+
+    store
+        .insert_order(
+            order.clone(),
+            executed.creator.to_string(),
+            spot_market,
+            chain_order_id,
+            executed.amount,
+            executed.filled_amount,
             ws,
         )
         .await;

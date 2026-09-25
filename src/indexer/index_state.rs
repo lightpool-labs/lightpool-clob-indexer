@@ -2,6 +2,7 @@
 // Author: xiaoyu1998
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::{DashMap, DashSet};
@@ -76,6 +77,8 @@ pub struct IndexState {
     vault_by_account: DashMap<String, Uuid>,
     vault_portfolio: DashMap<Uuid, HashMap<String, u64>>,
     persist: Option<SharedPersist>,
+    /// Block unix-seconds while applying a ReceiptBlock (0 when idle / unknown).
+    indexing_block_timestamp_secs: AtomicU64,
 }
 
 pub type SharedIndexState = Arc<IndexState>;
@@ -100,6 +103,7 @@ fn stored_to_persist_row(stored: &StoredOrder) -> PersistOrderRow {
         spot_market: stored.spot_market.clone(),
         size_raw: stored.size_raw,
         filled_raw: stored.filled_raw,
+        status_ts_ms: 0,
     }
 }
 
@@ -121,7 +125,19 @@ impl IndexState {
             vault_by_account: DashMap::new(),
             vault_portfolio: DashMap::new(),
             persist,
+            indexing_block_timestamp_secs: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_indexing_block_timestamp(&self, timestamp_secs: u64) {
+        self.indexing_block_timestamp_secs
+            .store(timestamp_secs, Ordering::Relaxed);
+    }
+
+    /// Block wall time in ms for the block currently being applied; 0 if unknown.
+    pub fn indexing_block_timestamp_ms(&self) -> u64 {
+        let secs = self.indexing_block_timestamp_secs.load(Ordering::Relaxed);
+        secs.saturating_mul(1000)
     }
 
 
@@ -140,6 +156,7 @@ impl IndexState {
         self.vault_by_address.clear();
         self.vault_by_account.clear();
         self.vault_portfolio.clear();
+        self.indexing_block_timestamp_secs.store(0, Ordering::Relaxed);
     }
 
     pub async fn market_count(&self) -> usize {
@@ -176,6 +193,7 @@ impl IndexState {
                     spot_market: stored.spot_market.clone(),
                     size_raw: stored.size_raw,
                     filled_raw: stored.filled_raw,
+                    status_ts_ms: 0,
                 }
             })
             .collect()
@@ -873,7 +891,14 @@ impl IndexState {
         let Some(persist) = &self.persist else {
             return;
         };
-        persist.enqueue_order_history(row.clone());
+        let mut row = row.clone();
+        if row.status_ts_ms == 0 {
+            let ms = self.indexing_block_timestamp_ms();
+            if ms > 0 {
+                row.status_ts_ms = ms;
+            }
+        }
+        persist.enqueue_order_history(row);
     }
 
     fn remove_hot_order(&self, order_id: Uuid, stored: &StoredOrder) {

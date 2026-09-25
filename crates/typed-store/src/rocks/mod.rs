@@ -37,7 +37,7 @@ use std::{
     time::Duration,
 };
 use std::{collections::HashSet, ffi::CStr};
-use lightpool_macros::{fail_point, nondeterministic};
+use typed_macros::{fail_point, nondeterministic};
 use tap::TapFallible;
 #[cfg(all(not(target_os = "windows"), feature = "tide_hunter"))]
 use tidehunter::{db::Db as TideHunterDb, key_shape::KeySpace};

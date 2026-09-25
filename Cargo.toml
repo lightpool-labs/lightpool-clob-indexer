@@ -4,11 +4,11 @@ members = [
   "crates/typed-store",
   "crates/typed-store-derive",
   "crates/typed-store-error",
-  "crates/lightpool-macros",
+  "crates/typed-macros",
 ]
 resolver = "2"
 
-# Shared deps for vendored lightpool crates (typed-store / lightpool-macros).
+# Shared deps for vendored typed-store crates (typed-store / typed-macros).
 # Keep versions aligned with lightpool/Cargo.toml workspace.dependencies.
 [workspace.dependencies]
 anyhow = "1.0.38"
@@ -40,7 +40,7 @@ futures = "0.3.14"
 typed-store = { path = "crates/typed-store" }
 typed-store-derive = { path = "crates/typed-store-derive" }
 typed-store-error = { path = "crates/typed-store-error" }
-lightpool-macros = { path = "crates/lightpool-macros" }
+typed-macros = { path = "crates/typed-macros" }
 
 [package]
 name = "lightpool-clob-indexer"

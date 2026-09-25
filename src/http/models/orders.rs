@@ -32,4 +32,11 @@ pub struct ListedOrder {
     pub user_address: String,
     pub size_raw: u64,
     pub filled_raw: u64,
+    /// Present for historical orders (archive time). Omitted when zero.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub status_ts_ms: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }

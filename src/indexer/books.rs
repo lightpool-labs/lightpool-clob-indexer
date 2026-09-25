@@ -448,6 +448,7 @@ impl Books {
         last_trade_price: u64,
         publish_ws: bool,
         mut ws: Option<&mut IndexWriteSet>,
+        trade_time_ms: Option<u64>,
     ) {
         if price_raw == 0 || fill_amount_raw == 0 {
             return;
@@ -487,6 +488,7 @@ impl Books {
                     price_raw,
                     fill_amount_raw,
                     block_num,
+                    trade_time_ms,
                 ) {
                     if let Some(delta) = delta.as_mut() {
                         delta.trade = Some(trade);
@@ -521,16 +523,19 @@ impl Books {
         price_raw: u64,
         size_raw: u64,
         block_num: u64,
+        trade_time_ms: Option<u64>,
     ) -> Option<RecentTrade> {
         let id = trade_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let side = match side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
         };
-        let time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
+        let time_ms = trade_time_ms.filter(|ms| *ms > 0).unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0)
+        });
         let trade = RecentTrade {
             id,
             side: side.into(),

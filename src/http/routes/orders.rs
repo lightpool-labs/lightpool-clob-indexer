@@ -161,6 +161,7 @@ async fn list_historical_orders(
     )?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
+        let status_ts_ms = row.status_ts_ms;
         let mut record = crate::indexer::OrderQueryRecord {
             order: row.order,
             chain_order_id: row.chain_order_id,
@@ -170,7 +171,7 @@ async fn list_historical_orders(
             filled_raw: row.filled_raw,
         };
         enrich_order_record(&state, &mut record).await;
-        out.push(listed_from_record(record));
+        out.push(listed_from_record_with_ts(record, status_ts_ms));
     }
     Ok(Json(out))
 }
@@ -193,6 +194,13 @@ async fn enrich_order_record(state: &AppState, record: &mut crate::indexer::Orde
 }
 
 fn listed_from_record(record: crate::indexer::OrderQueryRecord) -> ListedOrder {
+    listed_from_record_with_ts(record, 0)
+}
+
+fn listed_from_record_with_ts(
+    record: crate::indexer::OrderQueryRecord,
+    status_ts_ms: u64,
+) -> ListedOrder {
     ListedOrder {
         order: record.order,
         chain_order_id: record.chain_order_id,
@@ -200,6 +208,7 @@ fn listed_from_record(record: crate::indexer::OrderQueryRecord) -> ListedOrder {
         user_address: record.user_address,
         size_raw: record.size_raw,
         filled_raw: record.filled_raw,
+        status_ts_ms,
     }
 }
 

@@ -394,6 +394,7 @@ impl IndexStateStore {
                 spot_market: row.spot_market,
                 size_raw: row.size_raw as u64,
                 filled_raw: row.filled_raw as u64,
+                status_ts_ms: 0,
             });
         }
         Ok(out)

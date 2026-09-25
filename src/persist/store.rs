@@ -674,6 +674,7 @@ impl StateStore {
                 spot_market,
                 size_raw: size_raw as u64,
                 filled_raw: filled_raw as u64,
+                status_ts_ms: 0,
             });
         }
         Ok(out)
@@ -899,10 +900,14 @@ impl StateStore {
             .map_err(|e| AppError::Internal(format!("serialize order history: {e}")))?;
         let user = row.user_address.trim().to_ascii_lowercase();
         let spot = normalize_spot_market_key(&row.spot_market);
-        let status_ts_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let status_ts_ms = if row.status_ts_ms > 0 {
+            row.status_ts_ms as i64
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        };
         self.conn
             .execute(
                 "INSERT INTO order_history
@@ -943,7 +948,7 @@ impl StateStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT user_address, chain_order_id, spot_market, size_raw, filled_raw, payload
+                "SELECT user_address, chain_order_id, spot_market, size_raw, filled_raw, payload, status_ts_ms
                  FROM order_history
                  WHERE user_address = ?1
                  ORDER BY status_ts_ms DESC
@@ -959,12 +964,13 @@ impl StateStore {
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|e| AppError::Internal(format!("sqlite query order_history: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (user_address, chain_order_id, spot_market, size_raw, filled_raw, payload) =
+            let (user_address, chain_order_id, spot_market, size_raw, filled_raw, payload, status_ts_ms) =
                 row.map_err(|e| AppError::Internal(format!("sqlite order_history row: {e}")))?;
             let order: Order = serde_json::from_str(&payload)
                 .map_err(|e| AppError::Internal(format!("deserialize order history: {e}")))?;
@@ -975,6 +981,7 @@ impl StateStore {
                 spot_market,
                 size_raw: size_raw as u64,
                 filled_raw: filled_raw as u64,
+                status_ts_ms: status_ts_ms.max(0) as u64,
             });
         }
         Ok(out)
