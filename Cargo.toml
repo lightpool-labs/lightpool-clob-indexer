@@ -44,7 +44,7 @@ typed-macros = { path = "crates/typed-macros" }
 
 [package]
 name = "lightpool-clob-indexer"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 publish = false

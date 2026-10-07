@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "lightpool-clob-indexer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -4321,7 +4321,7 @@ dependencies = [
 
 [[package]]
 name = "typed-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bcs",
@@ -4361,7 +4361,7 @@ dependencies = [
 
 [[package]]
 name = "typed-store-error"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",

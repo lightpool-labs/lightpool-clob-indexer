@@ -195,6 +195,7 @@ fn build_place_without_sign(
         limit_price: price_raw,
         token_address: lock_token,
         cloid: Some(format!("elm-burst-{seq}")),
+        whitelist: None,
     };
     let action = ActionBuilder::place_order(spot_market, params)
         .map_err(|e| anyhow::anyhow!("place_order action: {e}"))?;
@@ -449,6 +450,7 @@ async fn create_markets(
                 side_book_size: SegmentSize::Large,
                 creator,
                 access: Default::default(),
+                whitelist: None,
             })
             .map_err(|e| anyhow::anyhow!("create_market action: {e}"))?;
             actions.push(market_action);
