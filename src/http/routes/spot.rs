@@ -12,13 +12,18 @@ use std::str::FromStr;
 
 use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
 use crate::error::{AppError, AppResult};
-use crate::http::models::{BookResponse, MarketInfoResponse};
+use crate::http::models::{
+    BookResponse, MarketInfoResponse, OracleMarkHistoryResponse, OracleMarkHistoryTick,
+    OracleMarkResponse,
+};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/:spot_market/book", get(get_book))
         .route("/:spot_market/info", get(get_market_info))
+        .route("/:spot_market/oracle/history", get(get_oracle_history))
+        .route("/:spot_market/oracle", get(get_oracle_mark))
         .route("/:spot_market/bars", get(get_bars))
 }
 
@@ -37,6 +42,12 @@ pub struct BarsQuery {
     pub interval: Option<String>,
     pub from: Option<u64>,
     pub to: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OracleHistoryQuery {
+    pub from_ms: Option<u64>,
     pub limit: Option<usize>,
 }
 
@@ -102,6 +113,57 @@ async fn get_market_info(
         maker_fee_bps: info.maker_fee_bps,
         taker_fee_bps: info.taker_fee_bps,
         allow_market_orders: info.allow_market_orders,
+    }))
+}
+
+async fn get_oracle_mark(
+    State(state): State<AppState>,
+    Path(spot_market): Path<String>,
+) -> AppResult<Json<OracleMarkResponse>> {
+    let mark = state
+        .index
+        .oracle_mark(&spot_market)
+        .await
+        .ok_or_else(|| {
+            AppError::NotFound(format!("oracle mark for {spot_market} not found"))
+        })?;
+    Ok(Json(OracleMarkResponse {
+        spot_market: mark.spot_market,
+        round: mark.round,
+        oracle_price: crate::chain::format_oracle_human(mark.oracle_price),
+        mark_price: crate::chain::format_oracle_human(mark.mark_price),
+        oracle_price_raw: mark.oracle_price,
+        mark_price_raw: mark.mark_price,
+        block_num: mark.block_num,
+        ts_ms: mark.ts_ms,
+        source: "oracle_committed",
+    }))
+}
+
+async fn get_oracle_history(
+    State(state): State<AppState>,
+    Path(spot_market): Path<String>,
+    Query(query): Query<OracleHistoryQuery>,
+) -> AppResult<Json<OracleMarkHistoryResponse>> {
+    let limit = query.limit.unwrap_or(600).clamp(1, 3_600);
+    let ticks = state
+        .index
+        .oracle_mark_history(&spot_market, query.from_ms, limit)
+        .await;
+    Ok(Json(OracleMarkHistoryResponse {
+        spot_market: crate::spot_market::normalize_spot_market_key(&spot_market),
+        ticks: ticks
+            .into_iter()
+            .map(|t| OracleMarkHistoryTick {
+                t: t.ts_ms,
+                mark_price: crate::chain::format_oracle_human(t.mark_price),
+                oracle_price: crate::chain::format_oracle_human(t.oracle_price),
+                mark_price_raw: t.mark_price,
+                oracle_price_raw: t.oracle_price,
+                round: t.round,
+                block_num: t.block_num,
+            })
+            .collect(),
     }))
 }
 

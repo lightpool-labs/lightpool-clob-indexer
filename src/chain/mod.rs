@@ -3,8 +3,9 @@
 
 use lightpool_sdk::lightpool_types::call::{GetBalance, GetBalanceParams};
 use lightpool_sdk::lightpool_types::call::{
-    GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams, GetTokenInfo,
-    GetTokenInfoParams,
+    GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams, GetPaperAccount,
+    GetPaperAccountParams, GetPaperLp, GetPaperLpParams, GetPaperQueue, GetPaperQueueParams,
+    GetTokenInfo, GetTokenInfoParams,
 };
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
@@ -145,6 +146,87 @@ impl ChainClient {
         bincode::deserialize(&bytes)
             .map_err(|e| AppError::Internal(format!("decode GetTokenInfo: {e}")))
     }
+
+    /// Live paper account via node `get_acct` (inputs resolved from warmup).
+    pub async fn get_paper_account(
+        &self,
+        user: Address,
+        paper_market: ContractAddress,
+    ) -> AppResult<GetPaperAccount> {
+        let action = ActionBuilder::get_paper_account(paper_market, GetPaperAccountParams {})
+            .map_err(|e| AppError::Internal(format!("build get_paper_account action: {e}")))?;
+
+        let call_tx = TransactionBuilder::new()
+            .sender(user)
+            .account(user)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_paper_account call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_acct failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetPaperAccount: {e}")))
+    }
+
+    /// Live paper LP buckets + queue heads via node `get_lp`.
+    pub async fn get_paper_lp(
+        &self,
+        paper_market: ContractAddress,
+    ) -> AppResult<GetPaperLp> {
+        let action = ActionBuilder::get_paper_lp(paper_market, GetPaperLpParams {})
+            .map_err(|e| AppError::Internal(format!("build get_paper_lp action: {e}")))?;
+
+        let caller = Address::ZERO;
+        let call_tx = TransactionBuilder::new()
+            .sender(caller)
+            .account(caller)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_paper_lp call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_lp failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetPaperLp: {e}")))
+    }
+
+    /// Live paper queue tip via node `get_queue`.
+    pub async fn get_paper_queue(
+        &self,
+        paper_market: ContractAddress,
+    ) -> AppResult<GetPaperQueue> {
+        let action = ActionBuilder::get_paper_queue(paper_market, GetPaperQueueParams {})
+            .map_err(|e| AppError::Internal(format!("build get_paper_queue action: {e}")))?;
+
+        let caller = Address::ZERO;
+        let call_tx = TransactionBuilder::new()
+            .sender(caller)
+            .account(caller)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_paper_queue call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_queue failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetPaperQueue: {e}")))
+    }
 }
 
 pub fn format_token_amount(raw: u64) -> String {
@@ -162,6 +244,19 @@ pub fn format_price_pieces(raw: u64) -> String {
     let numerator = raw.saturating_mul(100);
     let whole = numerator / TOKEN_SCALE;
     let frac = numerator % TOKEN_SCALE;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac_str = format!("{frac:06}");
+    let trimmed = frac_str.trim_end_matches('0');
+    format!("{whole}.{trimmed}")
+}
+
+/// Human dollars for spot/oracle fixed-point (`raw / TOKEN_SCALE`).
+pub fn format_oracle_human(raw: u64) -> String {
+    use lightpool_sdk::TOKEN_SCALE;
+    let whole = raw / TOKEN_SCALE;
+    let frac = raw % TOKEN_SCALE;
     if frac == 0 {
         return whole.to_string();
     }

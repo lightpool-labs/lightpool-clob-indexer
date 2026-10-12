@@ -1,15 +1,20 @@
 // Copyright (c) LightPool Labs
 // Author: xiaoyu1998
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, DashSet};
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{broadcast, RwLock as TokioRwLock};
 use uuid::Uuid;
 
-use crate::domain::{Market, MarketCategory, MarketQuery, MarketSortOrder, Order, Vault, VaultQuery};
+use crate::domain::{
+    Market, MarketCategory, MarketQuery, MarketSortOrder, Order, PaperCloseKind,
+    PaperPositionHistory, PaperPositionOpen, PaperPositionQuery, PaperPositionStatus, Vault,
+    VaultQuery,
+};
 use crate::persist::{
     index_write_set::{order_row_from_parts, IndexWriteSet},
     PersistOrderRow, SharedPersist,
@@ -18,6 +23,7 @@ use crate::spot_market::{
     normalize_spot_market_key, onchain_order_id, split_onchain_order_id, OnchainOrderId,
 };
 use crate::bars::Bars;
+use crate::ws::models::{OracleMarkWsMessage, PaperPositionWsMessage, PaperUserWsMessage};
 
 use super::books::Books;
 
@@ -60,6 +66,36 @@ pub struct OrderQueryRecord {
     pub filled_raw: u64,
 }
 
+/// Max retained oracle/mark ticks per spot market (in-memory ring).
+const ORACLE_HISTORY_LIMIT: usize = 3_600;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OracleMark {
+    pub spot_market: String,
+    pub round: u64,
+    pub oracle_price: u64,
+    pub mark_price: u64,
+    pub block_num: u64,
+    /// Wall-clock ms when the tick was indexed (block timestamp when known).
+    pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OracleMarkTick {
+    pub ts_ms: u64,
+    pub round: u64,
+    pub oracle_price: u64,
+    pub mark_price: u64,
+    pub block_num: u64,
+}
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Concurrent in-memory index (orders/markets/vaults) plus sharded order books and bars.
 pub struct IndexState {
     pub books: Books,
@@ -69,6 +105,16 @@ pub struct IndexState {
     spot_to_market: DashMap<String, SpotMarketRef>,
     spot_by_name: DashMap<String, String>,
     last_trade_price: DashMap<String, u64>,
+    /// Latest on-chain oracle/mark from `oracle_committed` events, keyed by spot market.
+    oracle_marks: DashMap<String, OracleMark>,
+    /// Recent oracle/mark ticks per spot market (newest at back).
+    oracle_history: DashMap<String, VecDeque<OracleMarkTick>>,
+    /// Per-market WS fan-out for oracle mark updates.
+    oracle_publishers: DashMap<String, broadcast::Sender<OracleMarkWsMessage>>,
+    /// Global WS fan-out for paper user position events (filter by user_address).
+    paper_user_publisher: broadcast::Sender<PaperUserWsMessage>,
+    /// Global WS fan-out for all paper position lifecycle events (keepers).
+    paper_positions_publisher: broadcast::Sender<PaperPositionWsMessage>,
     orders: DashMap<Uuid, StoredOrder>,
     orders_by_id: DashMap<OnchainOrderId, Uuid>,
     orders_by_user: DashMap<String, DashSet<Uuid>>,
@@ -76,6 +122,10 @@ pub struct IndexState {
     vault_by_address: DashMap<String, Uuid>,
     vault_by_account: DashMap<String, Uuid>,
     vault_portfolio: DashMap<Uuid, HashMap<String, u64>>,
+    /// Open paper positions keyed by `{market}:{position}`.
+    paper_positions_open: DashMap<String, PaperPositionOpen>,
+    /// Closed / liquidated paper positions (append-only history).
+    paper_positions_history: DashMap<String, PaperPositionHistory>,
     persist: Option<SharedPersist>,
     /// Block unix-seconds while applying a ReceiptBlock (0 when idle / unknown).
     indexing_block_timestamp_secs: AtomicU64,
@@ -117,6 +167,17 @@ impl IndexState {
             spot_to_market: DashMap::new(),
             spot_by_name: DashMap::new(),
             last_trade_price: DashMap::new(),
+            oracle_marks: DashMap::new(),
+            oracle_history: DashMap::new(),
+            oracle_publishers: DashMap::new(),
+            paper_user_publisher: {
+                let (sender, _) = broadcast::channel(512);
+                sender
+            },
+            paper_positions_publisher: {
+                let (sender, _) = broadcast::channel(512);
+                sender
+            },
             orders: DashMap::new(),
             orders_by_id: DashMap::new(),
             orders_by_user: DashMap::new(),
@@ -124,6 +185,8 @@ impl IndexState {
             vault_by_address: DashMap::new(),
             vault_by_account: DashMap::new(),
             vault_portfolio: DashMap::new(),
+            paper_positions_open: DashMap::new(),
+            paper_positions_history: DashMap::new(),
             persist,
             indexing_block_timestamp_secs: AtomicU64::new(0),
         }
@@ -149,6 +212,9 @@ impl IndexState {
         self.spot_to_market.clear();
         self.spot_by_name.clear();
         self.last_trade_price.clear();
+        self.oracle_marks.clear();
+        self.oracle_history.clear();
+        self.oracle_publishers.clear();
         self.orders.clear();
         self.orders_by_id.clear();
         self.orders_by_user.clear();
@@ -156,8 +222,260 @@ impl IndexState {
         self.vault_by_address.clear();
         self.vault_by_account.clear();
         self.vault_portfolio.clear();
+        self.paper_positions_open.clear();
+        self.paper_positions_history.clear();
         self.indexing_block_timestamp_secs.store(0, Ordering::Relaxed);
     }
+
+    fn paper_position_key(market: &str, position: u64) -> String {
+        format!("{}:{}", addr_key(market), position)
+    }
+
+    pub async fn upsert_paper_position_open(&self, row: PaperPositionOpen) {
+        let key = Self::paper_position_key(&row.market, row.position);
+        self.publish_paper_lifecycle(
+            "opened",
+            &row.owner,
+            &row.market,
+            row.position,
+            row.opened_block,
+            Some(row.instrument),
+            Some(row.is_long),
+            Some(row.bust_price_raw),
+        );
+        self.paper_positions_open.insert(key, row);
+    }
+
+    pub fn publish_paper_lifecycle(
+        &self,
+        event: &str,
+        user_address: &str,
+        market: &str,
+        position: u64,
+        block_num: u64,
+        instrument: Option<u32>,
+        is_long: Option<bool>,
+        bust_price_raw: Option<u64>,
+    ) {
+        let _ = self.paper_user_publisher.send(PaperUserWsMessage {
+            msg_type: "paper_user".into(),
+            event: event.to_string(),
+            user_address: user_address.to_string(),
+            market: market.to_string(),
+            position,
+            block_num,
+        });
+        let _ = self.paper_positions_publisher.send(PaperPositionWsMessage {
+            msg_type: "paper_position".into(),
+            event: event.to_string(),
+            user_address: user_address.to_string(),
+            market: market.to_string(),
+            position,
+            block_num,
+            instrument,
+            is_long,
+            bust_price_raw,
+        });
+    }
+
+    pub fn subscribe_paper_user(&self) -> broadcast::Receiver<PaperUserWsMessage> {
+        self.paper_user_publisher.subscribe()
+    }
+
+    pub fn subscribe_paper_positions(&self) -> broadcast::Receiver<PaperPositionWsMessage> {
+        self.paper_positions_publisher.subscribe()
+    }
+
+    pub async fn close_paper_position(
+        &self,
+        market: &str,
+        position: u64,
+        owner_fallback: &str,
+        closed_block: u64,
+        exit_price: String,
+        fee: String,
+        payout: String,
+        queued: String,
+        minted: String,
+        pnl: String,
+        kind: PaperCloseKind,
+        liquidator: Option<String>,
+    ) {
+        let key = Self::paper_position_key(market, position);
+        let open = self.paper_positions_open.remove(&key).map(|(_, v)| v);
+        let (instrument, is_long, margin, notional, entry_price, bust_price, owner, opened_block) =
+            if let Some(o) = open {
+                (
+                    o.instrument,
+                    o.is_long,
+                    o.margin,
+                    o.notional,
+                    o.entry_price,
+                    o.bust_price,
+                    o.owner,
+                    o.opened_block,
+                )
+            } else {
+                (
+                    0,
+                    true,
+                    "0".into(),
+                    "0".into(),
+                    "0".into(),
+                    "0".into(),
+                    owner_fallback.to_string(),
+                    0,
+                )
+            };
+        let event = match kind {
+            PaperCloseKind::Liquidated => "liquidated",
+            PaperCloseKind::Closed => "closed",
+        };
+        self.publish_paper_lifecycle(
+            event,
+            &owner,
+            market,
+            position,
+            closed_block,
+            Some(instrument),
+            Some(is_long),
+            None,
+        );
+        let hist = PaperPositionHistory {
+            market: addr_key(market),
+            position,
+            owner,
+            instrument,
+            is_long,
+            margin,
+            notional,
+            entry_price,
+            bust_price,
+            exit_price,
+            pnl,
+            fee,
+            payout,
+            queued,
+            minted,
+            kind,
+            liquidator,
+            opened_block,
+            closed_block,
+        };
+        self.paper_positions_history.insert(key, hist);
+    }
+
+    pub async fn query_paper_positions(
+        &self,
+        query: PaperPositionQuery,
+    ) -> (Vec<PaperPositionOpen>, Vec<PaperPositionHistory>, u32) {
+        let owner = query.owner.as_ref().map(|s| user_key(s));
+        let market = query.market.as_ref().map(|s| addr_key(s));
+        let limit = query.limit.max(1) as usize;
+        let offset = query.offset as usize;
+
+        let mut open_rows: Vec<PaperPositionOpen> = self
+            .paper_positions_open
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|row| {
+                owner
+                    .as_ref()
+                    .map(|o| user_key(&row.owner) == *o)
+                    .unwrap_or(true)
+                    && market
+                        .as_ref()
+                        .map(|m| addr_key(&row.market) == *m)
+                        .unwrap_or(true)
+            })
+            .collect();
+        open_rows.sort_by(|a, b| {
+            b.opened_block
+                .cmp(&a.opened_block)
+                .then(b.position.cmp(&a.position))
+        });
+
+        let mut hist_rows: Vec<PaperPositionHistory> = self
+            .paper_positions_history
+            .iter()
+            .map(|e| e.value().clone())
+            .filter(|row| {
+                owner
+                    .as_ref()
+                    .map(|o| user_key(&row.owner) == *o)
+                    .unwrap_or(true)
+                    && market
+                        .as_ref()
+                        .map(|m| addr_key(&row.market) == *m)
+                        .unwrap_or(true)
+            })
+            .collect();
+        hist_rows.sort_by(|a, b| {
+            b.closed_block
+                .cmp(&a.closed_block)
+                .then(b.position.cmp(&a.position))
+        });
+
+        match query.status {
+            PaperPositionStatus::Open => {
+                let total = open_rows.len() as u32;
+                let page = open_rows.into_iter().skip(offset).take(limit).collect();
+                (page, Vec::new(), total)
+            }
+            PaperPositionStatus::Closed => {
+                let total = hist_rows.len() as u32;
+                let page = hist_rows.into_iter().skip(offset).take(limit).collect();
+                (Vec::new(), page, total)
+            }
+            PaperPositionStatus::All => {
+                let open_len = open_rows.len();
+                let total = (open_len + hist_rows.len()) as u32;
+                let page_open: Vec<_> = open_rows.into_iter().skip(offset).take(limit).collect();
+                let remain = limit.saturating_sub(page_open.len());
+                let hist_skip = offset.saturating_sub(open_len);
+                let page_hist: Vec<_> = hist_rows
+                    .into_iter()
+                    .skip(hist_skip)
+                    .take(remain)
+                    .collect();
+                (page_open, page_hist, total)
+            }
+        }
+    }
+
+    pub async fn sum_open_margin(&self, owner: &str, market: Option<&str>) -> u64 {
+        let owner = user_key(owner);
+        let market = market.map(addr_key);
+        self.paper_positions_open
+            .iter()
+            .filter(|e| {
+                let row = e.value();
+                user_key(&row.owner) == owner
+                    && market
+                        .as_ref()
+                        .map(|m| addr_key(&row.market) == *m)
+                        .unwrap_or(true)
+            })
+            .map(|e| e.value().margin_raw)
+            .sum()
+    }
+
+    pub async fn count_open_positions(&self, owner: &str, market: Option<&str>) -> u32 {
+        let owner = user_key(owner);
+        let market = market.map(addr_key);
+        self.paper_positions_open
+            .iter()
+            .filter(|e| {
+                let row = e.value();
+                user_key(&row.owner) == owner
+                    && market
+                        .as_ref()
+                        .map(|m| addr_key(&row.market) == *m)
+                        .unwrap_or(true)
+            })
+            .count() as u32
+    }
+
 
     pub async fn market_count(&self) -> usize {
         self.markets.len()
@@ -784,6 +1102,123 @@ impl IndexState {
     pub async fn last_trade_price(&self, spot_market: &str) -> Option<u64> {
         let key = normalize_spot_market_key(spot_market);
         self.last_trade_price.get(&key).map(|e| *e)
+    }
+
+    fn oracle_ws_message(mark: &OracleMark) -> OracleMarkWsMessage {
+        OracleMarkWsMessage {
+            msg_type: "oracle".into(),
+            spot_market: mark.spot_market.clone(),
+            round: mark.round,
+            oracle_price: crate::chain::format_oracle_human(mark.oracle_price),
+            mark_price: crate::chain::format_oracle_human(mark.mark_price),
+            oracle_price_raw: mark.oracle_price,
+            mark_price_raw: mark.mark_price,
+            block_num: mark.block_num,
+            ts_ms: mark.ts_ms,
+        }
+    }
+
+    fn oracle_publisher(&self, spot_market: &str) -> broadcast::Sender<OracleMarkWsMessage> {
+        let key = normalize_spot_market_key(spot_market);
+        self.oracle_publishers
+            .entry(key)
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(256);
+                sender
+            })
+            .clone()
+    }
+
+    pub async fn record_oracle_mark(
+        &self,
+        spot_market: &str,
+        round: u64,
+        oracle_price: u64,
+        mark_price: u64,
+        block_num: u64,
+    ) {
+        let key = normalize_spot_market_key(spot_market);
+        let mut ts_ms = self.indexing_block_timestamp_ms();
+        if ts_ms == 0 {
+            ts_ms = wall_clock_ms();
+        }
+        let mark = OracleMark {
+            spot_market: key.clone(),
+            round,
+            oracle_price,
+            mark_price,
+            block_num,
+            ts_ms,
+        };
+        let tick = OracleMarkTick {
+            ts_ms,
+            round,
+            oracle_price,
+            mark_price,
+            block_num,
+        };
+        {
+            let mut hist = self
+                .oracle_history
+                .entry(key.clone())
+                .or_insert_with(VecDeque::new);
+            if let Some(last) = hist.back() {
+                // Keep one sample per ms; overwrite same-timestamp updates.
+                if last.ts_ms == ts_ms {
+                    *hist.back_mut().expect("back exists") = tick.clone();
+                } else {
+                    hist.push_back(tick);
+                }
+            } else {
+                hist.push_back(tick);
+            }
+            while hist.len() > ORACLE_HISTORY_LIMIT {
+                hist.pop_front();
+            }
+        }
+        let msg = Self::oracle_ws_message(&mark);
+        self.oracle_marks.insert(key.clone(), mark);
+        let _ = self.oracle_publisher(&key).send(msg);
+    }
+
+    pub async fn oracle_mark(&self, spot_market: &str) -> Option<OracleMark> {
+        let key = normalize_spot_market_key(spot_market);
+        self.oracle_marks.get(&key).map(|e| e.value().clone())
+    }
+
+    pub async fn oracle_mark_history(
+        &self,
+        spot_market: &str,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> Vec<OracleMarkTick> {
+        let key = normalize_spot_market_key(spot_market);
+        let limit = limit.clamp(1, ORACLE_HISTORY_LIMIT);
+        let Some(hist) = self.oracle_history.get(&key) else {
+            return Vec::new();
+        };
+        let filtered: Vec<OracleMarkTick> = hist
+            .iter()
+            .filter(|t| from_ms.map(|f| t.ts_ms >= f).unwrap_or(true))
+            .cloned()
+            .collect();
+        if filtered.len() <= limit {
+            return filtered;
+        }
+        filtered[filtered.len() - limit..].to_vec()
+    }
+
+    pub async fn oracle_mark_ws(&self, spot_market: &str) -> Option<OracleMarkWsMessage> {
+        self.oracle_mark(spot_market)
+            .await
+            .map(|mark| Self::oracle_ws_message(&mark))
+    }
+
+    pub async fn subscribe_oracle(
+        &self,
+        spot_market: &str,
+    ) -> broadcast::Receiver<OracleMarkWsMessage> {
+        self.oracle_publisher(spot_market).subscribe()
     }
 
     pub async fn has_chain_order(&self, spot_market: &str, chain_order_id: &str) -> bool {

@@ -15,6 +15,7 @@ pub fn router() -> Router<AppState> {
         .nest("/markets", routes::markets::router())
         .nest("/vaults", routes::vaults::router())
         .nest("/spot", routes::spot::router())
+        .nest("/paper", routes::paper::router())
         .nest("/accounts", routes::accounts::router())
         .nest("/orders", routes::orders::router())
         .nest("/tx", routes::tx::router())

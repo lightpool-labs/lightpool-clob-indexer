@@ -9,11 +9,14 @@ use lightpool_sdk::event_contract_events::{
     EventContractRedeemedEvent, EventContractResolvedEvent,
 };
 use lightpool_sdk::spot_events::{
-    MarketCreatedEvent, MarketOrderExecutedEvent, OrderCancelledEvent, OrderCreatedEvent,
-    OrderEventType, OrderFilledEvent, OrderUpdatedEvent, parse_spot_event_data,
+    MarketCreatedEvent, MarketOrderExecutedEvent, OracleCommittedEvent, OrderCancelledEvent,
+    OrderCreatedEvent, OrderEventType, OrderFilledEvent, OrderUpdatedEvent, parse_spot_event_data,
 };
 use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
+};
+use lightpool_sdk::paper_events::{
+    PaperClosedEvent, PaperLiquidatedEvent, PaperOpenedEvent,
 };
 use lightpool_sdk::vault_events::{
     VaultClosedEvent, VaultCreatedEvent, VaultDepositedEvent,
@@ -27,8 +30,8 @@ use crate::book_hydrate::{
     ensure_chain_hydrated, hydrate_all_spot_markets, hydrate_market_spots, SharedChainClient,
     DEFAULT_BOOK_DEPTH,
 };
-use crate::chain::{format_price_pieces, format_token_amount};
-use crate::domain::{Market, Order, Vault};
+use crate::chain::{format_oracle_human, format_price_pieces, format_token_amount};
+use crate::domain::{Market, Order, PaperCloseKind, PaperPositionOpen, Vault};
 use crate::persist::IndexWriteSet;
 use crate::submit_wait::SharedSubmitWaitRegistry;
 use crate::ws::process::SharedUserEventHub;
@@ -306,6 +309,7 @@ pub async fn process_prepared_block(
                 store,
                 action_name.as_str(),
                 event,
+                block_num,
                 &mut ws,
             )
             .await;
@@ -397,6 +401,7 @@ async fn apply_global_event(
     store: &SharedIndexState,
     action_name: &str,
     event: &TransactionEvent,
+    block_num: u64,
     ws: &mut IndexWriteSet,
 ) {
     let EventData::Bytes(data) = &event.data else {
@@ -492,8 +497,149 @@ async fn apply_global_event(
                 tracing::warn!(error = %e, "failed to decode market_created");
             }
         },
+        "oracle_committed" => match bincode::deserialize::<OracleCommittedEvent>(data) {
+            Ok(committed) => {
+                let spot_market = event
+                    .contract
+                    .as_ref()
+                    .map(|c| crate::spot_market::normalize_spot_market_key(&c.to_string()))
+                    .unwrap_or_default();
+                if spot_market.is_empty() {
+                    tracing::warn!("oracle_committed missing market contract");
+                } else {
+                    store
+                        .record_oracle_mark(
+                            &spot_market,
+                            committed.round,
+                            committed.oracle_price,
+                            committed.mark_price,
+                            block_num,
+                        )
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode oracle_committed");
+            }
+        },
+        "paper_opened" => match bincode::deserialize::<PaperOpenedEvent>(data) {
+            Ok(opened) => {
+                index_paper_opened(store, opened, block_num).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_opened");
+            }
+        },
+        "paper_closed" => match bincode::deserialize::<PaperClosedEvent>(data) {
+            Ok(closed) => {
+                index_paper_closed(store, closed, block_num).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_closed");
+            }
+        },
+        "paper_liquidated" => match bincode::deserialize::<PaperLiquidatedEvent>(data) {
+            Ok(liqd) => {
+                index_paper_liquidated(store, liqd, block_num).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_liquidated");
+            }
+        },
         _ => {}
     }
+}
+
+async fn index_paper_opened(store: &SharedIndexState, opened: PaperOpenedEvent, block_num: u64) {
+    let market = opened.market.to_string();
+    let row = PaperPositionOpen {
+        market: market.clone(),
+        position: opened.position,
+        owner: opened.owner.to_string(),
+        instrument: opened.instrument,
+        is_long: opened.is_long,
+        margin: format_token_amount(opened.margin),
+        notional: format_token_amount(opened.notional),
+        entry_price: format_oracle_human(opened.entry_price),
+        bust_price: format_oracle_human(opened.bust_price),
+        margin_raw: opened.margin,
+        notional_raw: opened.notional,
+        entry_price_raw: opened.entry_price,
+        bust_price_raw: opened.bust_price,
+        funded_from_queued: opened.funded_from_queued,
+        opened_block: block_num,
+    };
+    store.upsert_paper_position_open(row).await;
+    tracing::info!(
+        market = %market,
+        position = opened.position,
+        owner = %opened.owner,
+        instrument = opened.instrument,
+        "indexed paper_opened"
+    );
+}
+
+async fn index_paper_closed(store: &SharedIndexState, closed: PaperClosedEvent, block_num: u64) {
+    let market = closed.market.to_string();
+    store
+        .close_paper_position(
+            &market,
+            closed.position,
+            &closed.owner.to_string(),
+            block_num,
+            format_oracle_human(closed.exit_price),
+            format_token_amount(closed.fee),
+            format_token_amount(closed.payout),
+            format_token_amount(closed.queued),
+            format_token_amount(closed.minted),
+            format_i64_token(closed.pnl),
+            PaperCloseKind::Closed,
+            None,
+        )
+        .await;
+    tracing::info!(
+        market = %market,
+        position = closed.position,
+        owner = %closed.owner,
+        "indexed paper_closed"
+    );
+}
+
+async fn index_paper_liquidated(
+    store: &SharedIndexState,
+    liqd: PaperLiquidatedEvent,
+    block_num: u64,
+) {
+    let market = liqd.market.to_string();
+    store
+        .close_paper_position(
+            &market,
+            liqd.position,
+            &liqd.owner.to_string(),
+            block_num,
+            format_oracle_human(liqd.exit_price),
+            "0".into(),
+            "0".into(),
+            "0".into(),
+            format_token_amount(liqd.minted),
+            format_i64_token(-(liqd.margin as i64)),
+            PaperCloseKind::Liquidated,
+            Some(liqd.liquidator.to_string()),
+        )
+        .await;
+    tracing::info!(
+        market = %market,
+        position = liqd.position,
+        owner = %liqd.owner,
+        liquidator = %liqd.liquidator,
+        "indexed paper_liquidated"
+    );
+}
+
+fn format_i64_token(raw: i64) -> String {
+    let sign = if raw < 0 { "-" } else { "" };
+    let abs = raw.unsigned_abs();
+    format!("{sign}{}", format_token_amount(abs))
 }
 
 async fn apply_market_order_events(

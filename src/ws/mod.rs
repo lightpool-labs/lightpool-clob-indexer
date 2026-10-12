@@ -20,7 +20,8 @@ use crate::book_hydrate::DEFAULT_BOOK_DEPTH;
 use crate::state::AppState;
 
 use models::{
-    ws_error, WsRequest, CHANNEL_BARS, CHANNEL_ORDERBOOK_DELTA, CHANNEL_QUOTE, CHANNEL_USER,
+    ws_error, WsRequest, CHANNEL_BARS, CHANNEL_ORACLE, CHANNEL_ORDERBOOK_DELTA,
+    CHANNEL_PAPER_POSITIONS, CHANNEL_PAPER_USER, CHANNEL_QUOTE, CHANNEL_USER,
 };
 use process::WsSession;
 
@@ -140,6 +141,20 @@ async fn handle_request(
                     };
                     process::subscribe_user(state, sender, session, &user_address).await
                 }
+                CHANNEL_PAPER_USER => {
+                    let Some(user_address) =
+                        request.user_address.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing user_address").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_paper_user(state, sender, session, &user_address).await
+                }
+                CHANNEL_PAPER_POSITIONS => {
+                    process::subscribe_paper_positions(state, sender, session).await
+                }
                 CHANNEL_BARS => {
                     let Some(spot_market) =
                         request.spot_market.filter(|value| !value.trim().is_empty())
@@ -157,6 +172,17 @@ async fn handle_request(
                         request.interval.as_deref(),
                     )
                     .await
+                }
+                CHANNEL_ORACLE => {
+                    let Some(spot_market) =
+                        request.spot_market.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing spot_market").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_oracle(state, sender, session, &spot_market).await
                 }
                 _ => {
                     let _ = sender
@@ -194,12 +220,29 @@ async fn handle_request(
                         .filter(|value| !value.trim().is_empty());
                     process::unsubscribe_user(sender, session, user_address).await;
                 }
+                CHANNEL_PAPER_USER => {
+                    let user_address = request
+                        .user_address
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_paper_user(sender, session, user_address).await;
+                }
+                CHANNEL_PAPER_POSITIONS => {
+                    process::unsubscribe_paper_positions(sender, session).await;
+                }
                 CHANNEL_BARS => {
                     let spot_market = request
                         .spot_market
                         .as_deref()
                         .filter(|value| !value.trim().is_empty());
                     process::unsubscribe_bars(sender, session, spot_market).await;
+                }
+                CHANNEL_ORACLE => {
+                    let spot_market = request
+                        .spot_market
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_oracle(sender, session, spot_market).await;
                 }
                 _ => {}
             }

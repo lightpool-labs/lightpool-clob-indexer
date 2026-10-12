@@ -9,7 +9,10 @@ use tokio::task::JoinHandle;
 
 use crate::indexer::SharedIndexState;
 use crate::spot_market::normalize_spot_market_key;
-use crate::ws::models::{OrderBookDelta, QuoteDelta, UserWsMessage};
+use crate::ws::models::{
+    OracleMarkWsMessage, OrderBookDelta, PaperPositionWsMessage, PaperUserWsMessage, QuoteDelta,
+    UserWsMessage,
+};
 use crate::bars::BarWsMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,7 +20,10 @@ pub enum SubscriptionKey {
     Orderbook(String),
     Quote(String),
     User(String),
+    PaperUser(String),
+    PaperPositions,
     Bars(String),
+    Oracle(String),
 }
 
 pub struct WsSession {
@@ -134,6 +140,58 @@ impl WsSession {
         self.tasks.insert(SubscriptionKey::User(user_address), handle);
     }
 
+    pub fn subscribe_paper_user(
+        &mut self,
+        user_address: String,
+        mut rx: broadcast::Receiver<PaperUserWsMessage>,
+    ) {
+        self.cancel(SubscriptionKey::PaperUser(user_address.clone()));
+        let outbound = self.outbound.clone();
+        let filter = user_address.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(message) => {
+                        if !message.user_address.eq_ignore_ascii_case(&filter) {
+                            continue;
+                        }
+                        let text = serde_json::to_string(&message).unwrap_or_default();
+                        if outbound.send(Message::Text(text.into())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+        self.tasks
+            .insert(SubscriptionKey::PaperUser(user_address), handle);
+    }
+
+    pub fn subscribe_paper_positions(
+        &mut self,
+        mut rx: broadcast::Receiver<PaperPositionWsMessage>,
+    ) {
+        self.cancel(SubscriptionKey::PaperPositions);
+        let outbound = self.outbound.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(message) => {
+                        let text = serde_json::to_string(&message).unwrap_or_default();
+                        if outbound.send(Message::Text(text.into())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+        self.tasks.insert(SubscriptionKey::PaperPositions, handle);
+    }
+
     pub fn subscribe_bars(
         &mut self,
         spot_market: String,
@@ -156,6 +214,30 @@ impl WsSession {
             }
         });
         self.tasks.insert(SubscriptionKey::Bars(spot_market), handle);
+    }
+
+    pub fn subscribe_oracle(
+        &mut self,
+        spot_market: String,
+        mut rx: broadcast::Receiver<OracleMarkWsMessage>,
+    ) {
+        self.cancel(SubscriptionKey::Oracle(spot_market.clone()));
+        let outbound = self.outbound.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(mark) => {
+                        let text = serde_json::to_string(&mark).unwrap_or_default();
+                        if outbound.send(Message::Text(text.into())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+        self.tasks.insert(SubscriptionKey::Oracle(spot_market), handle);
     }
 
     pub fn cancel(&mut self, key: SubscriptionKey) {
@@ -184,7 +266,18 @@ impl WsSession {
                 {
                     true
                 }
+                ("paper.user", Some(user_address), SubscriptionKey::PaperUser(current))
+                    if current.eq_ignore_ascii_case(user_address) =>
+                {
+                    true
+                }
+                ("paper.positions", _, SubscriptionKey::PaperPositions) => true,
                 ("bars", Some(spot_market), SubscriptionKey::Bars(current))
+                    if current.eq_ignore_ascii_case(spot_market) =>
+                {
+                    true
+                }
+                ("oracle", Some(spot_market), SubscriptionKey::Oracle(current))
                     if current.eq_ignore_ascii_case(spot_market) =>
                 {
                     true
@@ -193,7 +286,10 @@ impl WsSession {
                     "orderbook_delta" => matches!(subscription, SubscriptionKey::Orderbook(_)),
                     "quote" => matches!(subscription, SubscriptionKey::Quote(_)),
                     "user" => matches!(subscription, SubscriptionKey::User(_)),
+                    "paper.user" => matches!(subscription, SubscriptionKey::PaperUser(_)),
+                    "paper.positions" => matches!(subscription, SubscriptionKey::PaperPositions),
                     "bars" => matches!(subscription, SubscriptionKey::Bars(_)),
+                    "oracle" => matches!(subscription, SubscriptionKey::Oracle(_)),
                     _ => false,
                 },
                 _ => false,

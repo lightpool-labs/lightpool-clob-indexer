@@ -55,7 +55,7 @@ All routes are under `/api`.
 | `GET` | `/api/spot/:market/bars` | Bars / candles |
 | `GET` | `/api/orders` | List orders |
 | `POST` | `/api/tx/submit` | Submit signed tx |
-| `WS` | `/api/ws` | Real-time feeds |
+| `WS` | `/api/ws` | Real-time feeds (`orderbook_delta`, `quote`, `user`, `bars`, `oracle`) |
 
 For full request/response shapes when wiring an app, use the Cursor skill in [lightpool-node](https://github.com/lightpool-labs/lightpool-node) (`plugins/spot-lightpool`).
 

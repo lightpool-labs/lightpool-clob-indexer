@@ -21,7 +21,8 @@ pub use processor::{
     apply_order_created_to_book, index_order_created, publish_user_order_created, ProcessOpts,
 };
 pub use index_state::{
-    IndexState, OrderQueryRecord, SharedIndexState, SharedIndexedBlockHead, new_head,
+    IndexState, OracleMark, OracleMarkTick, OrderQueryRecord, SharedIndexState,
+    SharedIndexedBlockHead, new_head,
 };
 
 use crate::book_hydrate::{hydrate_all_spot_markets, SharedChainClient};

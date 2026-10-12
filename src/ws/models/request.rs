@@ -7,6 +7,9 @@ pub const CHANNEL_ORDERBOOK_DELTA: &str = "orderbook_delta";
 pub const CHANNEL_QUOTE: &str = "quote";
 pub const CHANNEL_USER: &str = "user";
 pub const CHANNEL_BARS: &str = "bars";
+pub const CHANNEL_ORACLE: &str = "oracle";
+pub const CHANNEL_PAPER_USER: &str = "paper.user";
+pub const CHANNEL_PAPER_POSITIONS: &str = "paper.positions";
 
 #[derive(Debug, Deserialize)]
 pub struct WsRequest {
