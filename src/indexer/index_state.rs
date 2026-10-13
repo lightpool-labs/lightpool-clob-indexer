@@ -11,10 +11,11 @@ use tokio::sync::{broadcast, RwLock as TokioRwLock};
 use uuid::Uuid;
 
 use crate::domain::{
-    Market, MarketCategory, MarketQuery, MarketSortOrder, Order, PaperCloseKind,
-    PaperPositionHistory, PaperPositionOpen, PaperPositionQuery, PaperPositionStatus, Vault,
-    VaultQuery,
+    Market, MarketCategory, MarketQuery, MarketSortOrder, Order, PaperCloseKind, PaperHouseView,
+    PaperInstrumentExposure, PaperPositionHistory, PaperPositionOpen, PaperPositionQuery,
+    PaperPositionStatus, Vault, VaultQuery,
 };
+use lightpool_sdk::paper_events::PaperHouseAfter;
 use crate::persist::{
     index_write_set::{order_row_from_parts, IndexWriteSet},
     PersistOrderRow, SharedPersist,
@@ -66,8 +67,38 @@ pub struct OrderQueryRecord {
     pub filled_raw: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PaperInstrumentMeta {
+    name: String,
+    price_market: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaperInstrumentOi {
+    long: u64,
+    short: u64,
+}
+
+fn paper_instr_key(market: &str, instrument: u32) -> String {
+    format!("{}:{instrument}", addr_key(market))
+}
+
+fn format_i128_token(raw: i128) -> String {
+    use lightpool_sdk::TOKEN_SCALE;
+    let sign = if raw < 0 { "-" } else { "" };
+    let abs = raw.unsigned_abs();
+    let whole = abs / TOKEN_SCALE as u128;
+    let frac = abs % TOKEN_SCALE as u128;
+    if frac == 0 {
+        return format!("{sign}{whole}");
+    }
+    format!("{sign}{whole}.{frac:06}")
+}
+
 /// Max retained oracle/mark ticks per spot market (in-memory ring).
 const ORACLE_HISTORY_LIMIT: usize = 3_600;
+/// Max retained paper OI ticks per instrument (in-memory ring).
+const PAPER_OI_HISTORY_LIMIT: usize = 3_600;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OracleMark {
@@ -87,6 +118,13 @@ pub struct OracleMarkTick {
     pub oracle_price: u64,
     pub mark_price: u64,
     pub block_num: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaperOiTick {
+    pub ts_ms: u64,
+    pub long: u64,
+    pub short: u64,
 }
 
 fn wall_clock_ms() -> u64 {
@@ -126,6 +164,16 @@ pub struct IndexState {
     paper_positions_open: DashMap<String, PaperPositionOpen>,
     /// Closed / liquidated paper positions (append-only history).
     paper_positions_history: DashMap<String, PaperPositionHistory>,
+    /// Latest LP/queue snapshot from paper events (`PaperHouseAfter`), keyed by market.
+    paper_house: DashMap<String, PaperHouseAfter>,
+    /// Instrument meta from `paper_instrument_added`, keyed by `{market}:{instrument}`.
+    paper_instruments: DashMap<String, PaperInstrumentMeta>,
+    /// Per-instrument open interest (notional), keyed by `{market}:{instrument}`.
+    paper_oi: DashMap<String, PaperInstrumentOi>,
+    /// Recent long/short OI ticks per instrument (newest at back).
+    paper_oi_history: DashMap<String, VecDeque<PaperOiTick>>,
+    /// Lifetime traded notional per paper market (sum of opened notional).
+    paper_volume: DashMap<String, u64>,
     persist: Option<SharedPersist>,
     /// Block unix-seconds while applying a ReceiptBlock (0 when idle / unknown).
     indexing_block_timestamp_secs: AtomicU64,
@@ -187,6 +235,11 @@ impl IndexState {
             vault_portfolio: DashMap::new(),
             paper_positions_open: DashMap::new(),
             paper_positions_history: DashMap::new(),
+            paper_house: DashMap::new(),
+            paper_instruments: DashMap::new(),
+            paper_oi: DashMap::new(),
+            paper_oi_history: DashMap::new(),
+            paper_volume: DashMap::new(),
             persist,
             indexing_block_timestamp_secs: AtomicU64::new(0),
         }
@@ -224,6 +277,11 @@ impl IndexState {
         self.vault_portfolio.clear();
         self.paper_positions_open.clear();
         self.paper_positions_history.clear();
+        self.paper_house.clear();
+        self.paper_instruments.clear();
+        self.paper_oi.clear();
+        self.paper_oi_history.clear();
+        self.paper_volume.clear();
         self.indexing_block_timestamp_secs.store(0, Ordering::Relaxed);
     }
 
@@ -233,6 +291,13 @@ impl IndexState {
 
     pub async fn upsert_paper_position_open(&self, row: PaperPositionOpen) {
         let key = Self::paper_position_key(&row.market, row.position);
+        self.apply_paper_oi_delta(
+            &row.market,
+            row.instrument,
+            row.is_long,
+            row.notional_raw as i128,
+        );
+        self.record_paper_volume(&row.market, row.notional_raw);
         self.publish_paper_lifecycle(
             "opened",
             &row.owner,
@@ -244,6 +309,249 @@ impl IndexState {
             Some(row.bust_price_raw),
         );
         self.paper_positions_open.insert(key, row);
+    }
+
+    fn record_paper_volume(&self, market: &str, notional: u64) {
+        self.paper_volume
+            .entry(addr_key(market))
+            .and_modify(|v| *v = v.saturating_add(notional))
+            .or_insert(notional);
+    }
+
+    pub fn apply_paper_house_after(&self, market: &str, house: PaperHouseAfter) {
+        self.paper_house.insert(addr_key(market), house);
+    }
+
+    pub fn upsert_paper_instrument(
+        &self,
+        market: &str,
+        instrument: u32,
+        name: impl Into<String>,
+        price_market: impl Into<String>,
+    ) {
+        self.paper_instruments.insert(
+            paper_instr_key(market, instrument),
+            PaperInstrumentMeta {
+                name: name.into(),
+                price_market: normalize_spot_market_key(&price_market.into()),
+            },
+        );
+    }
+
+    fn apply_paper_oi_delta(&self, market: &str, instrument: u32, is_long: bool, delta: i128) {
+        let key = paper_instr_key(market, instrument);
+        let mut entry = self
+            .paper_oi
+            .entry(key)
+            .or_insert_with(PaperInstrumentOi::default);
+        if is_long {
+            if delta >= 0 {
+                entry.long = entry.long.saturating_add(delta as u64);
+            } else {
+                entry.long = entry.long.saturating_sub((-delta) as u64);
+            }
+        } else if delta >= 0 {
+            entry.short = entry.short.saturating_add(delta as u64);
+        } else {
+            entry.short = entry.short.saturating_sub((-delta) as u64);
+        }
+        let long = entry.long;
+        let short = entry.short;
+        drop(entry);
+        self.push_paper_oi_history(market, instrument, long, short);
+    }
+
+    fn push_paper_oi_history(&self, market: &str, instrument: u32, long: u64, short: u64) {
+        let key = paper_instr_key(market, instrument);
+        let block_ms = self.indexing_block_timestamp_ms();
+        let ts_ms = if block_ms > 0 {
+            block_ms
+        } else {
+            wall_clock_ms()
+        };
+        let tick = PaperOiTick { ts_ms, long, short };
+        let mut hist = self
+            .paper_oi_history
+            .entry(key)
+            .or_insert_with(VecDeque::new);
+        if let Some(last) = hist.back() {
+            if last.ts_ms == ts_ms {
+                *hist.back_mut().expect("back exists") = tick;
+            } else {
+                hist.push_back(tick);
+            }
+        } else {
+            hist.push_back(tick);
+        }
+        while hist.len() > PAPER_OI_HISTORY_LIMIT {
+            hist.pop_front();
+        }
+    }
+
+    pub fn paper_instrument_name(&self, market: &str, instrument: u32) -> String {
+        self.paper_instruments
+            .get(&paper_instr_key(market, instrument))
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("#{instrument}"))
+    }
+
+    pub async fn paper_oi_history(
+        &self,
+        market: &str,
+        instrument: u32,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> Vec<PaperOiTick> {
+        let key = paper_instr_key(market, instrument);
+        let limit = limit.clamp(1, PAPER_OI_HISTORY_LIMIT);
+        let Some(hist) = self.paper_oi_history.get(&key) else {
+            return Vec::new();
+        };
+        let filtered: Vec<PaperOiTick> = hist
+            .iter()
+            .filter(|t| from_ms.map(|f| t.ts_ms >= f).unwrap_or(true))
+            .cloned()
+            .collect();
+        if filtered.len() <= limit {
+            return filtered;
+        }
+        filtered[filtered.len() - limit..].to_vec()
+    }
+
+    /// Event-sourced house overview (no node call).
+    pub async fn paper_house_view(&self, market: &str) -> PaperHouseView {
+        use crate::chain::format_token_amount;
+
+        let market_key = addr_key(market);
+        let snap = self
+            .paper_house
+            .get(&market_key)
+            .map(|e| e.value().clone())
+            .unwrap_or(PaperHouseAfter {
+                free_cash: 0,
+                side_bucket: 0,
+                tracked_lp: 0,
+                tail_hwm: 0,
+                total_queued: 0,
+                queue_head: 0,
+                queue_tail: 0,
+                staker_fee_acc: 0,
+                dev_fee_acc: 0,
+            });
+
+        let mut open_margin_raw = 0u64;
+        let mut open_positions = 0u32;
+        let mut open_house_pnl_raw: i128 = 0;
+        for entry in self.paper_positions_open.iter() {
+            let row = entry.value();
+            if addr_key(&row.market) != market_key {
+                continue;
+            }
+            open_positions += 1;
+            open_margin_raw = open_margin_raw.saturating_add(row.margin_raw);
+            let mark = self
+                .paper_instruments
+                .get(&paper_instr_key(&row.market, row.instrument))
+                .and_then(|meta| {
+                    self.oracle_marks
+                        .get(&meta.price_market)
+                        .map(|m| m.mark_price)
+                })
+                .filter(|m| *m > 0)
+                .unwrap_or(row.entry_price_raw);
+            if row.entry_price_raw > 0 {
+                let diff = (mark as i128) - (row.entry_price_raw as i128);
+                let signed = if row.is_long { diff } else { -diff };
+                let user_pnl =
+                    (row.notional_raw as i128) * signed / (row.entry_price_raw as i128);
+                open_house_pnl_raw -= user_pnl;
+            }
+        }
+
+        let mut instruments: Vec<PaperInstrumentExposure> = Vec::new();
+        let mut open_interest_raw = 0u64;
+        for entry in self.paper_oi.iter() {
+            let key = entry.key();
+            let prefix = format!("{market_key}:");
+            let Some(instr_str) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(instrument) = instr_str.parse::<u32>() else {
+                continue;
+            };
+            let oi = entry.value();
+            if oi.long == 0 && oi.short == 0 {
+                continue;
+            }
+            open_interest_raw = open_interest_raw
+                .saturating_add(oi.long)
+                .saturating_add(oi.short);
+            let name = self
+                .paper_instruments
+                .get(key)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("#{instrument}"));
+            let net_raw = oi.long as i128 - oi.short as i128;
+            instruments.push(PaperInstrumentExposure {
+                instrument,
+                name,
+                long: format_token_amount(oi.long),
+                long_raw: oi.long,
+                short: format_token_amount(oi.short),
+                short_raw: oi.short,
+                net: format_i128_token(net_raw),
+                net_raw,
+            });
+        }
+        instruments.sort_by_key(|i| i.instrument);
+
+        let lp_balance_raw = snap.free_cash.saturating_add(snap.side_bucket);
+        let queue_debt_raw = snap.total_queued;
+        let house_funds_raw =
+            (lp_balance_raw as i128) + open_house_pnl_raw - (queue_debt_raw as i128);
+        let open_house_pnl_i64 = open_house_pnl_raw.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let volume_raw = self
+            .paper_volume
+            .get(&market_key)
+            .map(|v| *v)
+            .unwrap_or(0);
+
+        PaperHouseView {
+            market: market.to_string(),
+            free_cash: format_token_amount(snap.free_cash),
+            free_cash_raw: snap.free_cash,
+            side_bucket: format_token_amount(snap.side_bucket),
+            side_bucket_raw: snap.side_bucket,
+            tracked_lp: format_i128_token(snap.tracked_lp),
+            tracked_lp_raw: snap.tracked_lp,
+            tail_hwm: format_token_amount(snap.tail_hwm),
+            tail_hwm_raw: snap.tail_hwm,
+            queue_head: snap.queue_head,
+            queue_tail: snap.queue_tail,
+            total_queued: format_token_amount(snap.total_queued),
+            total_queued_raw: snap.total_queued,
+            staker_fee_acc: format_token_amount(snap.staker_fee_acc),
+            staker_fee_acc_raw: snap.staker_fee_acc,
+            dev_fee_acc: format_token_amount(snap.dev_fee_acc),
+            dev_fee_acc_raw: snap.dev_fee_acc,
+            queue_nonempty: snap.total_queued > 0,
+            open_interest: format_token_amount(open_interest_raw),
+            open_interest_raw,
+            open_margin: format_token_amount(open_margin_raw),
+            open_margin_raw,
+            open_positions,
+            instruments,
+            lp_balance: format_token_amount(lp_balance_raw),
+            lp_balance_raw,
+            open_house_pnl: format_i128_token(open_house_pnl_raw),
+            open_house_pnl_raw: open_house_pnl_i64,
+            queue_debt: format_token_amount(queue_debt_raw),
+            queue_debt_raw,
+            house_funds: format_i128_token(house_funds_raw),
+            house_funds_raw,
+            volume: format_token_amount(volume_raw),
+            volume_raw,
+        }
     }
 
     pub fn publish_paper_lifecycle(
@@ -305,6 +613,12 @@ impl IndexState {
         let open = self.paper_positions_open.remove(&key).map(|(_, v)| v);
         let (instrument, is_long, margin, notional, entry_price, bust_price, owner, opened_block) =
             if let Some(o) = open {
+                self.apply_paper_oi_delta(
+                    market,
+                    o.instrument,
+                    o.is_long,
+                    -(o.notional_raw as i128),
+                );
                 (
                     o.instrument,
                     o.is_long,

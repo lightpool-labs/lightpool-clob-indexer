@@ -16,7 +16,8 @@ use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
 };
 use lightpool_sdk::paper_events::{
-    PaperClosedEvent, PaperLiquidatedEvent, PaperOpenedEvent,
+    PaperClosedEvent, PaperFeesPushedEvent, PaperHarvestedEvent, PaperInstrumentAddedEvent,
+    PaperLiquidatedEvent, PaperOpenedEvent, PaperQueuedEvent,
 };
 use lightpool_sdk::vault_events::{
     VaultClosedEvent, VaultCreatedEvent, VaultDepositedEvent,
@@ -522,6 +523,19 @@ async fn apply_global_event(
                 tracing::warn!(error = %e, "failed to decode oracle_committed");
             }
         },
+        "paper_instrument_added" => match bincode::deserialize::<PaperInstrumentAddedEvent>(data) {
+            Ok(added) => {
+                store.upsert_paper_instrument(
+                    &added.market.to_string(),
+                    added.instrument,
+                    added.name.to_string(),
+                    added.price_market.to_string(),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_instrument_added");
+            }
+        },
         "paper_opened" => match bincode::deserialize::<PaperOpenedEvent>(data) {
             Ok(opened) => {
                 index_paper_opened(store, opened, block_num).await;
@@ -544,6 +558,30 @@ async fn apply_global_event(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode paper_liquidated");
+            }
+        },
+        "paper_queued" => match bincode::deserialize::<PaperQueuedEvent>(data) {
+            Ok(queued) => {
+                store.apply_paper_house_after(&queued.market.to_string(), queued.house);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_queued");
+            }
+        },
+        "paper_harvested" => match bincode::deserialize::<PaperHarvestedEvent>(data) {
+            Ok(harvested) => {
+                store.apply_paper_house_after(&harvested.market.to_string(), harvested.house);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_harvested");
+            }
+        },
+        "paper_fees_pushed" => match bincode::deserialize::<PaperFeesPushedEvent>(data) {
+            Ok(pushed) => {
+                store.apply_paper_house_after(&pushed.market.to_string(), pushed.house);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_fees_pushed");
             }
         },
         _ => {}
@@ -569,6 +607,7 @@ async fn index_paper_opened(store: &SharedIndexState, opened: PaperOpenedEvent, 
         funded_from_queued: opened.funded_from_queued,
         opened_block: block_num,
     };
+    store.apply_paper_house_after(&market, opened.house);
     store.upsert_paper_position_open(row).await;
     tracing::info!(
         market = %market,
@@ -581,6 +620,7 @@ async fn index_paper_opened(store: &SharedIndexState, opened: PaperOpenedEvent, 
 
 async fn index_paper_closed(store: &SharedIndexState, closed: PaperClosedEvent, block_num: u64) {
     let market = closed.market.to_string();
+    store.apply_paper_house_after(&market, closed.house.clone());
     store
         .close_paper_position(
             &market,
@@ -611,6 +651,7 @@ async fn index_paper_liquidated(
     block_num: u64,
 ) {
     let market = liqd.market.to_string();
+    store.apply_paper_house_after(&market, liqd.house.clone());
     store
         .close_paper_position(
             &market,

@@ -12,12 +12,13 @@ use std::str::FromStr;
 
 use crate::chain::format_token_amount;
 use crate::domain::{
-    PaperAccountView, PaperHouseView, PaperPositionQuery, PaperPositionStatus,
-    DEFAULT_PAPER_PAGE_LIMIT, MAX_PAPER_PAGE_LIMIT,
+    PaperAccountView, PaperPositionQuery, PaperPositionStatus, DEFAULT_PAPER_PAGE_LIMIT,
+    MAX_PAPER_PAGE_LIMIT,
 };
 use crate::error::{AppError, AppResult};
 use crate::http::models::{
-    PaperAccountResponse, PaperHistoryResponse, PaperHouseResponse, PaperPositionsResponse,
+    PaperAccountResponse, PaperHistoryResponse, PaperHouseResponse, PaperOiHistoryResponse,
+    PaperOiHistoryTick, PaperPositionsResponse,
 };
 use crate::state::AppState;
 
@@ -49,12 +50,21 @@ pub struct HouseQuery {
     pub market: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OiHistoryQuery {
+    pub market: String,
+    pub instrument: Option<u32>,
+    pub from_ms: Option<u64>,
+    pub limit: Option<usize>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/positions", get(list_positions))
         .route("/history", get(list_history))
         .route("/account", get(get_account))
         .route("/house", get(get_house))
+        .route("/house/oi/history", get(get_oi_history))
 }
 
 fn page_limit(raw: Option<u32>) -> u32 {
@@ -179,19 +189,7 @@ fn format_i64_amount(raw: i64) -> String {
     format!("{sign}{}", format_token_amount(raw.unsigned_abs()))
 }
 
-fn format_i128_amount(raw: i128) -> String {
-    let sign = if raw < 0 { "-" } else { "" };
-    let abs = raw.unsigned_abs();
-    // tracked_lp is also in TOKEN_SCALE units.
-    use lightpool_sdk::TOKEN_SCALE;
-    let whole = abs / TOKEN_SCALE as u128;
-    let frac = abs % TOKEN_SCALE as u128;
-    if frac == 0 {
-        return format!("{sign}{whole}");
-    }
-    format!("{sign}{whole}.{frac:06}")
-}
-
+/// Event-sourced house snapshot — no `get_lp` / `get_mkt` node call.
 async fn get_house(
     State(state): State<AppState>,
     Query(params): Query<HouseQuery>,
@@ -200,45 +198,43 @@ async fn get_house(
     if market_raw.is_empty() {
         return Err(AppError::BadRequest("market is required".into()));
     }
-    let paper_market = parse_token_contract(market_raw)
+    let _ = parse_token_contract(market_raw)
         .map_err(|e| AppError::BadRequest(format!("invalid paper market: {e}")))?;
 
-    let lp = state
-        .chain
-        .get_paper_lp(paper_market)
-        .await
-        .map_err(|e| AppError::Internal(format!("get_lp: {e}")))?;
+    let house = state.index.paper_house_view(market_raw).await;
+    Ok(Json(PaperHouseResponse { house }))
+}
 
-    // Prefer get_queue tip when available; fall back to LP embedded heads.
-    let (queue_head, queue_tail, total_queued) =
-        match state.chain.get_paper_queue(paper_market).await {
-            Ok(q) => (q.queue_head, q.queue_tail, q.total_queued),
-            Err(err) => {
-                tracing::debug!(error = %err, %market_raw, "get_queue fallback to get_lp");
-                (lp.queue_head, lp.queue_tail, lp.total_queued)
-            }
-        };
-
-    Ok(Json(PaperHouseResponse {
-        house: PaperHouseView {
-            market: market_raw.to_string(),
-            free_cash: format_token_amount(lp.free_cash),
-            free_cash_raw: lp.free_cash,
-            side_bucket: format_token_amount(lp.side_bucket),
-            side_bucket_raw: lp.side_bucket,
-            tracked_lp: format_i128_amount(lp.tracked_lp),
-            tracked_lp_raw: lp.tracked_lp,
-            tail_hwm: format_token_amount(lp.tail_hwm),
-            tail_hwm_raw: lp.tail_hwm,
-            queue_head,
-            queue_tail,
-            total_queued: format_token_amount(total_queued),
-            total_queued_raw: total_queued,
-            staker_fee_acc: format_token_amount(lp.staker_fee_acc),
-            staker_fee_acc_raw: lp.staker_fee_acc,
-            dev_fee_acc: format_token_amount(lp.dev_fee_acc),
-            dev_fee_acc_raw: lp.dev_fee_acc,
-            queue_nonempty: total_queued > 0,
-        },
+async fn get_oi_history(
+    State(state): State<AppState>,
+    Query(params): Query<OiHistoryQuery>,
+) -> AppResult<Json<PaperOiHistoryResponse>> {
+    let market_raw = params.market.trim();
+    if market_raw.is_empty() {
+        return Err(AppError::BadRequest("market is required".into()));
+    }
+    let _ = parse_token_contract(market_raw)
+        .map_err(|e| AppError::BadRequest(format!("invalid paper market: {e}")))?;
+    let instrument = params.instrument.unwrap_or(0);
+    let limit = params.limit.unwrap_or(600).clamp(1, 3_600);
+    let ticks = state
+        .index
+        .paper_oi_history(market_raw, instrument, params.from_ms, limit)
+        .await;
+    let name = state.index.paper_instrument_name(market_raw, instrument);
+    Ok(Json(PaperOiHistoryResponse {
+        market: market_raw.to_string(),
+        instrument,
+        name,
+        ticks: ticks
+            .into_iter()
+            .map(|t| PaperOiHistoryTick {
+                t: t.ts_ms,
+                long: format_token_amount(t.long),
+                short: format_token_amount(t.short),
+                long_raw: t.long,
+                short_raw: t.short,
+            })
+            .collect(),
     }))
 }

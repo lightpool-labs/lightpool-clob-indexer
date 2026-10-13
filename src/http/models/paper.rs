@@ -33,3 +33,20 @@ pub struct PaperAccountResponse {
 pub struct PaperHouseResponse {
     pub house: PaperHouseView,
 }
+
+#[derive(Debug, Serialize)]
+pub struct PaperOiHistoryTick {
+    pub t: u64,
+    pub long: String,
+    pub short: String,
+    pub long_raw: u64,
+    pub short_raw: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaperOiHistoryResponse {
+    pub market: String,
+    pub instrument: u32,
+    pub name: String,
+    pub ticks: Vec<PaperOiHistoryTick>,
+}

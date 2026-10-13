@@ -14,7 +14,8 @@ pub use market::{
 };
 pub use order::Order;
 pub use paper::{
-    PaperAccountView, PaperCloseKind, PaperHouseView, PaperPositionHistory, PaperPositionOpen,
+    PaperAccountView, PaperCloseKind, PaperHouseView, PaperInstrumentExposure,
+    PaperPositionHistory, PaperPositionOpen,
     PaperPositionQuery, PaperPositionStatus, DEFAULT_PAPER_PAGE_LIMIT, MAX_PAPER_PAGE_LIMIT,
 };
 pub use vault::{

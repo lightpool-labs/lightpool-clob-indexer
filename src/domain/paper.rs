@@ -54,6 +54,18 @@ pub struct PaperPositionHistory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperInstrumentExposure {
+    pub instrument: u32,
+    pub name: String,
+    pub long: String,
+    pub long_raw: u64,
+    pub short: String,
+    pub short_raw: u64,
+    pub net: String,
+    pub net_raw: i128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperHouseView {
     pub market: String,
     pub free_cash: String,
@@ -74,6 +86,28 @@ pub struct PaperHouseView {
     pub dev_fee_acc_raw: u64,
     /// True when payout queue has unpaid claims (`total_queued > 0`).
     pub queue_nonempty: bool,
+    /// User Positions: sum of long+short notional across instruments.
+    pub open_interest: String,
+    pub open_interest_raw: u64,
+    pub open_margin: String,
+    pub open_margin_raw: u64,
+    pub open_positions: u32,
+    pub instruments: Vec<PaperInstrumentExposure>,
+    /// Stats: free_cash + side_bucket.
+    pub lp_balance: String,
+    pub lp_balance_raw: u64,
+    /// Stats: −Σ trader unrealized PnL (house perspective).
+    pub open_house_pnl: String,
+    pub open_house_pnl_raw: i64,
+    /// Stats: alias of total_queued.
+    pub queue_debt: String,
+    pub queue_debt_raw: u64,
+    /// Stats: lp_balance + open_house_pnl − queue_debt.
+    pub house_funds: String,
+    pub house_funds_raw: i128,
+    /// Lifetime open notional (sum of `paper_opened.notional`).
+    pub volume: String,
+    pub volume_raw: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

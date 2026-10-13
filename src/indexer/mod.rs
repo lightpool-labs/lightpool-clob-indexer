@@ -21,7 +21,7 @@ pub use processor::{
     apply_order_created_to_book, index_order_created, publish_user_order_created, ProcessOpts,
 };
 pub use index_state::{
-    IndexState, OracleMark, OracleMarkTick, OrderQueryRecord, SharedIndexState,
+    IndexState, OracleMark, OracleMarkTick, OrderQueryRecord, PaperOiTick, SharedIndexState,
     SharedIndexedBlockHead, new_head,
 };
 
