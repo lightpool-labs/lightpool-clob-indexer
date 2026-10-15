@@ -148,7 +148,7 @@ pub struct PaperHouseTick {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PaperStakeTick {
     pub ts_ms: u64,
-    /// USDC in staking reward_pool (claimable pool).
+    /// Lifetime USDC pushed to stakers (same as total_staking_reward; never decreases on claim).
     pub staking_revenue: u64,
     /// PAPER token total supply.
     pub total_paper_supply: u64,
@@ -509,14 +509,10 @@ impl IndexState {
             } else {
                 0
             };
-            let staking_revenue = match chain
-                .get_paper_stake(Address::ZERO, paper_market)
-                .await
-            {
-                Ok(s) => s.reward_pool,
-                Err(_) => 0,
-            };
+            // Lifetime USDC pushed to stakers (never decreases on claim).
+            // Do not use reward_pool — that balance drops when users claim.
             let total_staking_reward = self.paper_total_staker_rewards(&market);
+            let staking_revenue = total_staking_reward;
             let tick = PaperStakeTick {
                 ts_ms,
                 staking_revenue,
