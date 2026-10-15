@@ -16,9 +16,11 @@ use lightpool_sdk::token_events::{
     TokenCreatedEvent, TokenMintedEvent, TransferEvent, parse_event_data,
 };
 use lightpool_sdk::paper_events::{
-    PaperClosedEvent, PaperFeesPushedEvent, PaperHarvestedEvent, PaperInstrumentAddedEvent,
-    PaperLiquidatedEvent, PaperOpenedEvent, PaperQueuedEvent,
+    PaperClaimedEvent, PaperClosedEvent, PaperFeesPushedEvent, PaperHarvestedEvent,
+    PaperInstrumentAddedEvent, PaperLiquidatedEvent, PaperOpenedEvent, PaperQueuedEvent,
+    PaperStakedEvent, PaperUnstakedEvent,
 };
+use crate::domain::PaperActivityItem;
 use lightpool_sdk::vault_events::{
     VaultClosedEvent, VaultCreatedEvent, VaultDepositedEvent,
     VaultDepositPermissionUpdatedEvent, VaultManagerUpdatedEvent, VaultWithdrawnEvent,
@@ -391,6 +393,11 @@ pub async fn process_prepared_block(
         );
     }
 
+    store.flush_paper_house_ws(opts.publish_ws).await;
+    store
+        .flush_paper_stake_history(chain, opts.publish_ws)
+        .await;
+
     ws.block_num = block_num;
     ws.digest = digest;
     ws
@@ -562,7 +569,13 @@ async fn apply_global_event(
         },
         "paper_queued" => match bincode::deserialize::<PaperQueuedEvent>(data) {
             Ok(queued) => {
-                store.apply_paper_house_after(&queued.market.to_string(), queued.house);
+                store.apply_paper_queued(
+                    &queued.market.to_string(),
+                    queued.index,
+                    &queued.user.to_string(),
+                    queued.amount,
+                    queued.house,
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode paper_queued");
@@ -570,7 +583,11 @@ async fn apply_global_event(
         },
         "paper_harvested" => match bincode::deserialize::<PaperHarvestedEvent>(data) {
             Ok(harvested) => {
-                store.apply_paper_house_after(&harvested.market.to_string(), harvested.house);
+                store.apply_paper_harvested(
+                    &harvested.market.to_string(),
+                    harvested.index,
+                    harvested.house,
+                );
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode paper_harvested");
@@ -578,10 +595,73 @@ async fn apply_global_event(
         },
         "paper_fees_pushed" => match bincode::deserialize::<PaperFeesPushedEvent>(data) {
             Ok(pushed) => {
-                store.apply_paper_house_after(&pushed.market.to_string(), pushed.house);
+                let market = pushed.market.to_string();
+                store.apply_paper_fees_pushed_rewards(
+                    &market,
+                    pushed.staker_fee,
+                    pushed.swept,
+                );
+                store.mark_paper_stake_dirty(&market);
+                store.apply_paper_house_after(&market, pushed.house);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to decode paper_fees_pushed");
+            }
+        },
+        "paper_claimed" => match bincode::deserialize::<PaperClaimedEvent>(data) {
+            Ok(claimed) => {
+                let market = claimed.market.to_string();
+                store.apply_paper_claimed_reward(
+                    &market,
+                    &claimed.user.to_string(),
+                    claimed.reward,
+                );
+                store.mark_paper_stake_dirty(&market);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_claimed");
+            }
+        },
+        "paper_staked" => match bincode::deserialize::<PaperStakedEvent>(data) {
+            Ok(staked) => {
+                let market = staked.market.to_string();
+                store.push_paper_activity(PaperActivityItem {
+                    kind: "staked".into(),
+                    market: market.clone(),
+                    user: staked.user.to_string(),
+                    amount: format_token_amount(staked.amount),
+                    amount_raw: staked.amount,
+                    pnl: None,
+                    pnl_raw: None,
+                    position: None,
+                    block_num,
+                    ts_ms: 0,
+                });
+                store.mark_paper_stake_dirty(&market);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_staked");
+            }
+        },
+        "paper_unstaked" => match bincode::deserialize::<PaperUnstakedEvent>(data) {
+            Ok(unstaked) => {
+                let market = unstaked.market.to_string();
+                store.push_paper_activity(PaperActivityItem {
+                    kind: "unstaked".into(),
+                    market: market.clone(),
+                    user: unstaked.user.to_string(),
+                    amount: format_token_amount(unstaked.amount),
+                    amount_raw: unstaked.amount,
+                    pnl: None,
+                    pnl_raw: None,
+                    position: None,
+                    block_num,
+                    ts_ms: 0,
+                });
+                store.mark_paper_stake_dirty(&market);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to decode paper_unstaked");
             }
         },
         _ => {}
@@ -633,10 +713,29 @@ async fn index_paper_closed(store: &SharedIndexState, closed: PaperClosedEvent, 
             format_token_amount(closed.queued),
             format_token_amount(closed.minted),
             format_i64_token(closed.pnl),
+            closed.pnl,
             PaperCloseKind::Closed,
             None,
         )
         .await;
+    // PAPER activity: losing closes that mint PAPER (or any negative PnL).
+    if closed.minted > 0 || closed.pnl < 0 {
+        store.push_paper_activity(PaperActivityItem {
+            kind: "close_loss".into(),
+            market: market.clone(),
+            user: closed.owner.to_string(),
+            amount: format_token_amount(closed.minted),
+            amount_raw: closed.minted,
+            pnl: Some(format_i64_token(closed.pnl)),
+            pnl_raw: Some(closed.pnl),
+            position: Some(closed.position),
+            block_num,
+            ts_ms: 0,
+        });
+    }
+    if closed.minted > 0 {
+        store.mark_paper_stake_dirty(&market);
+    }
     tracing::info!(
         market = %market,
         position = closed.position,
@@ -664,10 +763,24 @@ async fn index_paper_liquidated(
             "0".into(),
             format_token_amount(liqd.minted),
             format_i64_token(-(liqd.margin as i64)),
+            -(liqd.margin as i64),
             PaperCloseKind::Liquidated,
             Some(liqd.liquidator.to_string()),
         )
         .await;
+    store.push_paper_activity(PaperActivityItem {
+        kind: "liquidated".into(),
+        market: market.clone(),
+        user: liqd.owner.to_string(),
+        amount: format_token_amount(liqd.minted),
+        amount_raw: liqd.minted,
+        pnl: Some(format_i64_token(-(liqd.margin as i64))),
+        pnl_raw: Some(-(liqd.margin as i64)),
+        position: Some(liqd.position),
+        block_num,
+        ts_ms: 0,
+    });
+    store.mark_paper_stake_dirty(&market);
     tracing::info!(
         market = %market,
         position = liqd.position,

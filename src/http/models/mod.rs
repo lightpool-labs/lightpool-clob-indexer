@@ -13,8 +13,10 @@ pub use accounts::{BalanceEntry, BalanceTokenSpec, BalancesRequest};
 pub use markets::MarketsPageResponse;
 pub use orders::{CancelContextResponse, ListedOrder, OrderQueryResponse};
 pub use paper::{
-    PaperAccountResponse, PaperHistoryResponse, PaperHouseResponse, PaperOiHistoryResponse,
-    PaperOiHistoryTick, PaperPositionsResponse,
+    PaperAccountResponse, PaperActivityResponse, PaperDebtHistoryResponse, PaperDebtHistoryTick,
+    PaperHistoryResponse, PaperHouseHistoryResponse, PaperHouseHistoryTick, PaperHouseResponse,
+    PaperOiHistoryResponse, PaperOiHistoryTick, PaperPositionsResponse, PaperQueuePlacementResponse,
+    PaperStakeHistoryResponse, PaperStakeHistoryTick, PaperStakeResponse,
 };
 pub use spot::{
     BookResponse, MarketInfoResponse, OracleMarkHistoryResponse, OracleMarkHistoryTick,

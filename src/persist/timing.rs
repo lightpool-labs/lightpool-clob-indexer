@@ -30,6 +30,7 @@ pub enum PersistOpKind {
     Block,
     OrderHistory,
     ClosedBar,
+    PaperHouseHistory,
     IndexWrite,
 }
 
@@ -39,6 +40,7 @@ impl fmt::Display for PersistOpKind {
             PersistOpKind::Block => "block",
             PersistOpKind::OrderHistory => "history",
             PersistOpKind::ClosedBar => "bar",
+            PersistOpKind::PaperHouseHistory => "paper_house",
             PersistOpKind::IndexWrite => "index",
         };
         write!(f, "{name}")
@@ -51,6 +53,7 @@ impl PersistOpKind {
             PersistOp::SaveReceiptBlock(_) => PersistOpKind::Block,
             PersistOp::UpsertOrderHistory(_) => PersistOpKind::OrderHistory,
             PersistOp::SaveClosedBar(_) => PersistOpKind::ClosedBar,
+            PersistOp::SavePaperHouseHistory(_) => PersistOpKind::PaperHouseHistory,
             PersistOp::IndexWrite(_) => PersistOpKind::IndexWrite,
         }
     }

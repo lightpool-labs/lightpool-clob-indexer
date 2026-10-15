@@ -7,7 +7,8 @@ use futures_util::SinkExt;
 
 use crate::state::AppState;
 use crate::ws::models::{
-    ws_subscribed, ws_unsubscribed, CHANNEL_PAPER_POSITIONS, CHANNEL_PAPER_USER,
+    ws_subscribed, ws_unsubscribed, CHANNEL_PAPER_ACTIVITY, CHANNEL_PAPER_POSITIONS,
+    CHANNEL_PAPER_USER,
 };
 use crate::ws::process::WsSession;
 
@@ -67,6 +68,34 @@ pub async fn handle_unsubscribe_positions(
     let _ = sender
         .send(Message::Text(
             ws_unsubscribed(CHANNEL_PAPER_POSITIONS, "*").into(),
+        ))
+        .await;
+}
+
+pub async fn handle_subscribe_activity(
+    state: &AppState,
+    sender: &mut SplitSink<axum::extract::ws::WebSocket, Message>,
+    session: &mut WsSession,
+) -> bool {
+    let rx = state.index.subscribe_paper_activity();
+    session.subscribe_paper_activity(rx);
+
+    let _ = sender
+        .send(Message::Text(
+            ws_subscribed(CHANNEL_PAPER_ACTIVITY, "*").into(),
+        ))
+        .await;
+    true
+}
+
+pub async fn handle_unsubscribe_activity(
+    sender: &mut SplitSink<axum::extract::ws::WebSocket, Message>,
+    session: &mut WsSession,
+) {
+    session.cancel_channel(CHANNEL_PAPER_ACTIVITY, None);
+    let _ = sender
+        .send(Message::Text(
+            ws_unsubscribed(CHANNEL_PAPER_ACTIVITY, "*").into(),
         ))
         .await;
 }

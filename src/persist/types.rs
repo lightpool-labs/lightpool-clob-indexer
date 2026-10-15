@@ -6,6 +6,7 @@ use crate::domain::{Market, Order, Vault};
 
 pub const ORDER_HISTORY_LIMIT: usize = 2000;
 pub const BAR_HISTORY_LIMIT: usize = 5000;
+pub const PAPER_HOUSE_HISTORY_LIMIT: usize = 3_600;
 pub(crate) const DEFAULT_PERSIST_BATCH_MAX: usize = 128;
 pub(crate) const DEFAULT_PERSIST_BATCH_WAIT_MS: u64 = 2;
 /// Ingress queue holds cloned blocks (~MBs); keep this small.
@@ -26,6 +27,16 @@ pub struct ClosedBarRow {
     pub close_raw: u64,
     pub volume_raw: u64,
     pub trade_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaperHouseHistoryRow {
+    pub market: String,
+    pub ts_ms: u64,
+    pub house_funds_raw: i128,
+    pub lp_balance_raw: u64,
+    pub open_house_pnl_raw: i64,
+    pub queue_debt_raw: u64,
 }
 
 #[derive(Debug, Clone)]

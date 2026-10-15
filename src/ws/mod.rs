@@ -21,7 +21,9 @@ use crate::state::AppState;
 
 use models::{
     ws_error, WsRequest, CHANNEL_BARS, CHANNEL_ORACLE, CHANNEL_ORDERBOOK_DELTA,
-    CHANNEL_PAPER_POSITIONS, CHANNEL_PAPER_USER, CHANNEL_QUOTE, CHANNEL_USER,
+    CHANNEL_PAPER_ACTIVITY, CHANNEL_PAPER_HOUSE, CHANNEL_PAPER_POSITIONS, CHANNEL_PAPER_STAKE,
+    CHANNEL_PAPER_USER,
+    CHANNEL_QUOTE, CHANNEL_USER,
 };
 use process::WsSession;
 
@@ -155,6 +157,44 @@ async fn handle_request(
                 CHANNEL_PAPER_POSITIONS => {
                     process::subscribe_paper_positions(state, sender, session).await
                 }
+                CHANNEL_PAPER_ACTIVITY => {
+                    process::subscribe_paper_activity(state, sender, session).await
+                }
+                CHANNEL_PAPER_STAKE => {
+                    let Some(market) = request.market.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing market").into()))
+                            .await;
+                        return true;
+                    };
+                    let Some(user_address) =
+                        request.user_address.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing user_address").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_paper_stake(
+                        state,
+                        sender,
+                        session,
+                        &market,
+                        &user_address,
+                    )
+                    .await
+                }
+                CHANNEL_PAPER_HOUSE => {
+                    let Some(market) = request.market.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing market").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_paper_house(state, sender, session, &market).await
+                }
                 CHANNEL_BARS => {
                     let Some(spot_market) =
                         request.spot_market.filter(|value| !value.trim().is_empty())
@@ -229,6 +269,23 @@ async fn handle_request(
                 }
                 CHANNEL_PAPER_POSITIONS => {
                     process::unsubscribe_paper_positions(sender, session).await;
+                }
+                CHANNEL_PAPER_ACTIVITY => {
+                    process::unsubscribe_paper_activity(sender, session).await;
+                }
+                CHANNEL_PAPER_STAKE => {
+                    let market = request
+                        .market
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_paper_stake(sender, session, market).await;
+                }
+                CHANNEL_PAPER_HOUSE => {
+                    let market = request
+                        .market
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_paper_house(sender, session, market).await;
                 }
                 CHANNEL_BARS => {
                     let spot_market = request

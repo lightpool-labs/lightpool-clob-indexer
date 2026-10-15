@@ -9,7 +9,7 @@ use crate::peer::encode_block_payload;
 use crate::spot_market::normalize_spot_market_key;
 
 use super::index_write_set::IndexWriteSet;
-use super::types::{ClosedBarRow, PersistOrderRow};
+use super::types::{ClosedBarRow, PaperHouseHistoryRow, PersistOrderRow};
 
 /// Ingress job: blocks are cloned `ReceiptBlock`s; encode workers turn these into
 /// [`EncodedPersistOp`] before sqlite write. IndexWrite bypasses encode and goes
@@ -19,6 +19,7 @@ pub enum PersistOp {
     SaveReceiptBlock(ReceiptBlock),
     UpsertOrderHistory(PersistOrderRow),
     SaveClosedBar(ClosedBarRow),
+    SavePaperHouseHistory(PaperHouseHistoryRow),
     /// One block of index-state RocksDB deltas.
     IndexWrite(IndexWriteSet),
 }
@@ -42,6 +43,7 @@ pub enum EncodedPersistOp {
         payload: String,
     },
     SaveClosedBar(ClosedBarRow),
+    SavePaperHouseHistory(PaperHouseHistoryRow),
 }
 
 pub(crate) fn encode_persist_op(op: PersistOp) -> AppResult<EncodedPersistOp> {
@@ -71,6 +73,9 @@ pub(crate) fn encode_persist_op(op: PersistOp) -> AppResult<EncodedPersistOp> {
             })
         }
         PersistOp::SaveClosedBar(bar) => Ok(EncodedPersistOp::SaveClosedBar(bar)),
+        PersistOp::SavePaperHouseHistory(row) => {
+            Ok(EncodedPersistOp::SavePaperHouseHistory(row))
+        }
         PersistOp::IndexWrite(_) => Err(AppError::Internal(
             "index write must use dedicated index-write pipeline".into(),
         )),

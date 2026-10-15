@@ -10,6 +10,9 @@ pub const CHANNEL_BARS: &str = "bars";
 pub const CHANNEL_ORACLE: &str = "oracle";
 pub const CHANNEL_PAPER_USER: &str = "paper.user";
 pub const CHANNEL_PAPER_POSITIONS: &str = "paper.positions";
+pub const CHANNEL_PAPER_HOUSE: &str = "paper.house";
+pub const CHANNEL_PAPER_ACTIVITY: &str = "paper.activity";
+pub const CHANNEL_PAPER_STAKE: &str = "paper.stake";
 
 #[derive(Debug, Deserialize)]
 pub struct WsRequest {
@@ -17,6 +20,7 @@ pub struct WsRequest {
     pub channel: Option<String>,
     pub spot_market: Option<String>,
     pub user_address: Option<String>,
+    pub market: Option<String>,
     pub depth: Option<u32>,
     pub interval: Option<String>,
 }

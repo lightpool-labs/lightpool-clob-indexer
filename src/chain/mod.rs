@@ -4,8 +4,9 @@
 use lightpool_sdk::lightpool_types::call::{GetBalance, GetBalanceParams};
 use lightpool_sdk::lightpool_types::call::{
     GetMarket, GetMarketInfoParams, GetOrderBook, GetOrderBookParams, GetPaperAccount,
-    GetPaperAccountParams, GetPaperLp, GetPaperLpParams, GetPaperQueue, GetPaperQueueParams,
-    GetTokenInfo, GetTokenInfoParams,
+    GetPaperAccountParams, GetPaperLp, GetPaperLpParams, GetPaperMarket, GetPaperMarketParams,
+    GetPaperQueue, GetPaperQueueParams, GetPaperStake, GetPaperStakeParams, GetTokenInfo,
+    GetTokenInfoParams,
 };
 use lightpool_sdk::lightpool_types::SignedTransaction;
 use lightpool_sdk::types::SubmitTransactionResponse;
@@ -226,6 +227,60 @@ impl ChainClient {
 
         bincode::deserialize(&bytes)
             .map_err(|e| AppError::Internal(format!("decode GetPaperQueue: {e}")))
+    }
+
+    /// Live paper market config via node `get_mkt` (includes `paper_token`).
+    pub async fn get_paper_market(
+        &self,
+        paper_market: ContractAddress,
+    ) -> AppResult<GetPaperMarket> {
+        let action = ActionBuilder::get_paper_market(paper_market, GetPaperMarketParams {})
+            .map_err(|e| AppError::Internal(format!("build get_paper_market action: {e}")))?;
+
+        let caller = Address::ZERO;
+        let call_tx = TransactionBuilder::new()
+            .sender(caller)
+            .account(caller)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_paper_market call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_mkt failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetPaperMarket: {e}")))
+    }
+
+    /// Live paper stake via node `get_stake` (account = user).
+    pub async fn get_paper_stake(
+        &self,
+        user: Address,
+        paper_market: ContractAddress,
+    ) -> AppResult<GetPaperStake> {
+        let action = ActionBuilder::get_paper_stake(paper_market, GetPaperStakeParams {})
+            .map_err(|e| AppError::Internal(format!("build get_paper_stake action: {e}")))?;
+
+        let call_tx = TransactionBuilder::new()
+            .sender(user)
+            .account(user)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_without_sign()
+            .map_err(|e| AppError::Internal(format!("build get_paper_stake call tx: {e}")))?;
+
+        let bytes = self
+            .client
+            .call(call_tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("call get_stake failed: {e}")))?;
+
+        bincode::deserialize(&bytes)
+            .map_err(|e| AppError::Internal(format!("decode GetPaperStake: {e}")))
     }
 }
 

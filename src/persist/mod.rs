@@ -16,7 +16,8 @@ mod workers;
 pub use index_write_set::IndexWriteSet;
 pub use shared::{default_sqlite_path, SharedPersist};
 pub use types::{
-    CheckpointSnapshot, ClosedBarRow, PersistBookLevel, PersistBookMeta, PersistMeta,
-    PersistOrderRow, PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, ORDER_HISTORY_LIMIT,
+    CheckpointSnapshot, ClosedBarRow, PaperHouseHistoryRow, PersistBookLevel, PersistBookMeta,
+    PersistMeta, PersistOrderRow, PersistVaultPortfolioRow, BAR_HISTORY_LIMIT,
+    ORDER_HISTORY_LIMIT, PAPER_HOUSE_HISTORY_LIMIT,
 };
 pub use workers::PersistWorkers;

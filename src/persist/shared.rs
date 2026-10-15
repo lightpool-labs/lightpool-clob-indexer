@@ -20,9 +20,9 @@ use super::op::PersistOp;
 use super::store::{BlockStore, StateStore};
 use super::timing::{block_num_of, persist_timing, PersistOpKind, TimedPersistOp};
 use super::types::{
-    CheckpointSnapshot, ClosedBarRow, PersistBookLevel, PersistBookMeta, PersistMeta,
-    PersistOrderRow, PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, DEFAULT_PERSIST_QUEUE_CAPACITY,
-    SECONDARY_PENDING_LIMIT,
+    CheckpointSnapshot, ClosedBarRow, PaperHouseHistoryRow, PersistBookLevel, PersistBookMeta,
+    PersistMeta, PersistOrderRow, PersistVaultPortfolioRow, BAR_HISTORY_LIMIT,
+    DEFAULT_PERSIST_QUEUE_CAPACITY, SECONDARY_PENDING_LIMIT,
 };
 use super::workers::PersistWorkers;
 
@@ -264,6 +264,13 @@ impl SharedPersist {
         self.submit_nowait(&self.history_tx, PersistOp::SaveClosedBar(bar));
     }
 
+    pub fn enqueue_paper_house_history(&self, row: PaperHouseHistoryRow) {
+        if !self.secondary_ok() {
+            return;
+        }
+        self.submit_nowait(&self.history_tx, PersistOp::SavePaperHouseHistory(row));
+    }
+
     pub async fn enqueue_index_write(&self, ws: super::index_write_set::IndexWriteSet) {
         let Some(tx) = self.index_write_tx.as_ref() else {
             return;
@@ -376,6 +383,19 @@ impl SharedPersist {
         self.with_state(|store| {
             store.load_closed_bars(spot_market, interval, from_ts, to_ts, limit)
         })
+    }
+
+    pub fn load_paper_house_history(
+        &self,
+        market: &str,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> AppResult<Vec<PaperHouseHistoryRow>> {
+        self.with_state(|store| store.load_paper_house_history(market, from_ms, limit))
+    }
+
+    pub fn list_paper_house_history_markets(&self) -> AppResult<Vec<String>> {
+        self.with_state(|store| store.list_paper_house_history_markets())
     }
 
     pub fn upsert_order_history(&self, row: &PersistOrderRow) -> AppResult<()> {

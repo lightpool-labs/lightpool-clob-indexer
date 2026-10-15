@@ -5,6 +5,7 @@ mod books;
 mod pipeline;
 mod processor;
 mod index_state;
+mod paper_stake_view;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ pub use processor::{
     apply_order_created_to_book, index_order_created, publish_user_order_created, ProcessOpts,
 };
 pub use index_state::{
-    IndexState, OracleMark, OracleMarkTick, OrderQueryRecord, PaperOiTick, SharedIndexState,
-    SharedIndexedBlockHead, new_head,
+    IndexState, OracleMark, OracleMarkTick, OrderQueryRecord, PaperHouseTick, PaperOiTick,
+    PaperStakeTick, SharedIndexState, SharedIndexedBlockHead, new_head,
 };
 
 use crate::book_hydrate::{hydrate_all_spot_markets, SharedChainClient};
@@ -325,6 +326,7 @@ pub async fn recover_from_persist(
     submit_wait: &SharedSubmitWaitRegistry,
 ) -> AppResult<Option<PersistMeta>> {
     let snapshot = persist.load_into(index).await?;
+    index.hydrate_paper_house_history_from_persist();
     let blocks = persist.load_blocks_after(snapshot.as_ref().map(|m| m.block_num))?;
 
     if blocks.is_empty() {

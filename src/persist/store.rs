@@ -9,8 +9,9 @@ use crate::error::{AppError, AppResult};
 use crate::spot_market::normalize_spot_market_key;
 
 use super::types::{
-    ClosedBarRow, PersistBookLevel, PersistBookMeta, PersistMeta, PersistOrderRow,
-    PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, ORDER_HISTORY_LIMIT,
+    ClosedBarRow, PaperHouseHistoryRow, PersistBookLevel, PersistBookMeta, PersistMeta,
+    PersistOrderRow,
+    PersistVaultPortfolioRow, BAR_HISTORY_LIMIT, ORDER_HISTORY_LIMIT, PAPER_HOUSE_HISTORY_LIMIT,
 };
 
 pub(crate) struct BlockStore {
@@ -250,6 +251,18 @@ impl StateStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_bars_spot_interval_ts
                     ON bars(spot_market, interval, start_ts);
+
+                CREATE TABLE IF NOT EXISTS paper_house_history (
+                    market TEXT NOT NULL,
+                    ts_ms INTEGER NOT NULL,
+                    house_funds_raw TEXT NOT NULL,
+                    lp_balance_raw INTEGER NOT NULL,
+                    open_house_pnl_raw INTEGER NOT NULL,
+                    queue_debt_raw INTEGER NOT NULL,
+                    PRIMARY KEY (market, ts_ms)
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_house_history_market_ts
+                    ON paper_house_history(market, ts_ms);
 
                 CREATE TABLE IF NOT EXISTS order_history (
                     id TEXT PRIMARY KEY NOT NULL,
@@ -548,6 +561,15 @@ impl StateStore {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .map_err(|e| AppError::Internal(format!("sqlite prepare bars batch: {e}")))?;
+            let mut house_stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO paper_house_history
+                     (market, ts_ms, house_funds_raw, lp_balance_raw, open_house_pnl_raw, queue_debt_raw)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!("sqlite prepare paper_house_history batch: {e}"))
+                })?;
 
             for op in ops {
                 match op {
@@ -594,6 +616,22 @@ impl StateStore {
                                 AppError::Internal(format!("sqlite batch save_bar: {e}"))
                             })?;
                     }
+                    super::op::EncodedPersistOp::SavePaperHouseHistory(row) => {
+                        house_stmt
+                            .execute(params![
+                                row.market.trim().to_ascii_lowercase(),
+                                row.ts_ms as i64,
+                                row.house_funds_raw.to_string(),
+                                row.lp_balance_raw as i64,
+                                row.open_house_pnl_raw,
+                                row.queue_debt_raw as i64,
+                            ])
+                            .map_err(|e| {
+                                AppError::Internal(format!(
+                                    "sqlite batch paper_house_history: {e}"
+                                ))
+                            })?;
+                    }
                     super::op::EncodedPersistOp::SaveBlockBytes { .. } => {
                         return Err(AppError::Internal(
                             "block op in secondary state batch".into(),
@@ -606,8 +644,14 @@ impl StateStore {
             .map_err(|e| AppError::Internal(format!("sqlite commit state batch: {e}")))?;
 
         for op in ops {
-            if let super::op::EncodedPersistOp::SaveClosedBar(bar) = op {
-                self.trim_bars(&bar.spot_market, &bar.interval, BAR_HISTORY_LIMIT)?;
+            match op {
+                super::op::EncodedPersistOp::SaveClosedBar(bar) => {
+                    self.trim_bars(&bar.spot_market, &bar.interval, BAR_HISTORY_LIMIT)?;
+                }
+                super::op::EncodedPersistOp::SavePaperHouseHistory(row) => {
+                    self.trim_paper_house_history(&row.market, PAPER_HOUSE_HISTORY_LIMIT)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -846,6 +890,107 @@ impl StateStore {
             )
             .map_err(|e| AppError::Internal(format!("sqlite trim bars: {e}")))?;
         Ok(())
+    }
+
+    pub(crate) fn save_paper_house_history(&self, row: &PaperHouseHistoryRow) -> AppResult<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO paper_house_history
+                 (market, ts_ms, house_funds_raw, lp_balance_raw, open_house_pnl_raw, queue_debt_raw)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.market.trim().to_ascii_lowercase(),
+                    row.ts_ms as i64,
+                    row.house_funds_raw.to_string(),
+                    row.lp_balance_raw as i64,
+                    row.open_house_pnl_raw,
+                    row.queue_debt_raw as i64,
+                ],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite save paper_house_history: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn trim_paper_house_history(&self, market: &str, keep: usize) -> AppResult<()> {
+        let market = market.trim().to_ascii_lowercase();
+        let keep = keep.max(1) as i64;
+        self.conn
+            .execute(
+                "DELETE FROM paper_house_history
+                 WHERE market = ?1
+                   AND ts_ms < (
+                     SELECT MIN(ts_ms) FROM (
+                       SELECT ts_ms FROM paper_house_history
+                       WHERE market = ?1
+                       ORDER BY ts_ms DESC
+                       LIMIT ?2
+                     )
+                   )",
+                params![market, keep],
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite trim paper_house_history: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn load_paper_house_history(
+        &self,
+        market: &str,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> AppResult<Vec<PaperHouseHistoryRow>> {
+        let market = market.trim().to_ascii_lowercase();
+        let from = from_ms.unwrap_or(0) as i64;
+        let limit = limit.max(1).min(PAPER_HOUSE_HISTORY_LIMIT) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT market, ts_ms, house_funds_raw, lp_balance_raw, open_house_pnl_raw, queue_debt_raw
+                 FROM paper_house_history
+                 WHERE market = ?1 AND ts_ms >= ?2
+                 ORDER BY ts_ms DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| AppError::Internal(format!("sqlite prepare paper_house_history: {e}")))?;
+        let rows = stmt
+            .query_map(params![market, from, limit], |row| {
+                let funds: String = row.get(2)?;
+                Ok(PaperHouseHistoryRow {
+                    market: row.get(0)?,
+                    ts_ms: row.get::<_, i64>(1)? as u64,
+                    house_funds_raw: funds.parse::<i128>().unwrap_or(0),
+                    lp_balance_raw: row.get::<_, i64>(3)? as u64,
+                    open_house_pnl_raw: row.get(4)?,
+                    queue_debt_raw: row.get::<_, i64>(5)? as u64,
+                })
+            })
+            .map_err(|e| AppError::Internal(format!("sqlite query paper_house_history: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| {
+                AppError::Internal(format!("sqlite paper_house_history row: {e}"))
+            })?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub(crate) fn list_paper_house_history_markets(&self) -> AppResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT market FROM paper_house_history")
+            .map_err(|e| {
+                AppError::Internal(format!("sqlite prepare paper_house markets: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| AppError::Internal(format!("sqlite query paper_house markets: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| {
+                AppError::Internal(format!("sqlite paper_house market row: {e}"))
+            })?);
+        }
+        Ok(out)
     }
 
     pub(crate) fn load_closed_bars(

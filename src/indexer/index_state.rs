@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::{DashMap, DashSet};
@@ -11,20 +11,28 @@ use tokio::sync::{broadcast, RwLock as TokioRwLock};
 use uuid::Uuid;
 
 use crate::domain::{
-    Market, MarketCategory, MarketQuery, MarketSortOrder, Order, PaperCloseKind, PaperHouseView,
-    PaperInstrumentExposure, PaperPositionHistory, PaperPositionOpen, PaperPositionQuery,
-    PaperPositionStatus, Vault, VaultQuery,
+    Market, MarketCategory, MarketQuery, MarketSortOrder, Order, PaperActivityItem, PaperCloseKind,
+    PaperHouseView, PaperInstrumentExposure, PaperPositionHistory, PaperPositionOpen,
+    PaperPositionQuery, PaperPositionStatus, Vault, VaultQuery,
 };
 use lightpool_sdk::paper_events::PaperHouseAfter;
 use crate::persist::{
     index_write_set::{order_row_from_parts, IndexWriteSet},
-    PersistOrderRow, SharedPersist,
+    PaperHouseHistoryRow, PersistOrderRow, SharedPersist, PAPER_HOUSE_HISTORY_LIMIT,
 };
 use crate::spot_market::{
     normalize_spot_market_key, onchain_order_id, split_onchain_order_id, OnchainOrderId,
 };
 use crate::bars::Bars;
-use crate::ws::models::{OracleMarkWsMessage, PaperPositionWsMessage, PaperUserWsMessage};
+use crate::ws::models::{
+    OracleMarkWsMessage, PaperActivityWsMessage, PaperHouseWsMessage, PaperPositionWsMessage,
+    PaperStakeWsMessage, PaperUserWsMessage,
+};
+use crate::book_hydrate::SharedChainClient;
+use lightpool_sdk::{parse_token_contract, Address};
+use crate::chain::format_token_amount;
+
+pub const PAPER_ACTIVITY_LIMIT: usize = 120;
 
 use super::books::Books;
 
@@ -127,7 +135,39 @@ pub struct PaperOiTick {
     pub short: u64,
 }
 
-fn wall_clock_ms() -> u64 {
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaperHouseTick {
+    pub ts_ms: u64,
+    pub house_funds: i128,
+    pub lp_balance: u64,
+    pub open_house_pnl: i64,
+    pub queue_debt: u64,
+}
+
+/// 1h paper staking metrics (~1 tick/sec when dirty).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaperStakeTick {
+    pub ts_ms: u64,
+    /// USDC in staking reward_pool (claimable pool).
+    pub staking_revenue: u64,
+    /// PAPER token total supply.
+    pub total_paper_supply: u64,
+    /// Lifetime USDC distributed to stakers (fees_pushed staker_fee+swept).
+    pub total_staking_reward: u64,
+}
+
+pub const PAPER_STAKE_HISTORY_LIMIT: usize = 3_600;
+
+#[derive(Debug, Clone)]
+struct PaperQueueClaim {
+    market: String,
+    index: u64,
+    user: String,
+    amount: u64,
+    queued_at_ms: u64,
+}
+
+pub(crate) fn wall_clock_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -153,6 +193,10 @@ pub struct IndexState {
     paper_user_publisher: broadcast::Sender<PaperUserWsMessage>,
     /// Global WS fan-out for all paper position lifecycle events (keepers).
     paper_positions_publisher: broadcast::Sender<PaperPositionWsMessage>,
+    /// Per-market WS fan-out for house overview snapshots.
+    paper_house_publishers: DashMap<String, broadcast::Sender<PaperHouseWsMessage>>,
+    /// Markets whose house view should be republished at end of block.
+    paper_house_dirty: DashSet<String>,
     orders: DashMap<Uuid, StoredOrder>,
     orders_by_id: DashMap<OnchainOrderId, Uuid>,
     orders_by_user: DashMap<String, DashSet<Uuid>>,
@@ -172,8 +216,22 @@ pub struct IndexState {
     paper_oi: DashMap<String, PaperInstrumentOi>,
     /// Recent long/short OI ticks per instrument (newest at back).
     paper_oi_history: DashMap<String, VecDeque<PaperOiTick>>,
+    /// Recent house-metric ticks per paper market (newest at back).
+    paper_house_history: DashMap<String, VecDeque<PaperHouseTick>>,
+    /// Open payout-queue claims keyed by `{market}:{index}`.
+    paper_queue_open: DashMap<String, PaperQueueClaim>,
     /// Lifetime traded notional per paper market (sum of opened notional).
     paper_volume: DashMap<String, u64>,
+    /// Lifetime USDC pushed to stakers (`staker_fee + swept` from `paper_fees_pushed`).
+    paper_total_staker_rewards: DashMap<String, u64>,
+    /// Lifetime USDC claimed per `{market}:{user}` from `paper_claimed.reward`.
+    paper_rewards_claimed: DashMap<String, u64>,
+    /// Recent close-loss / liqd / stake / unstake feed (newest at back).
+    paper_activity: Mutex<VecDeque<PaperActivityItem>>,
+    paper_activity_publisher: broadcast::Sender<PaperActivityWsMessage>,
+    paper_stake_dirty: DashSet<String>,
+    paper_stake_history: DashMap<String, VecDeque<PaperStakeTick>>,
+    paper_stake_publishers: DashMap<String, broadcast::Sender<PaperStakeWsMessage>>,
     persist: Option<SharedPersist>,
     /// Block unix-seconds while applying a ReceiptBlock (0 when idle / unknown).
     indexing_block_timestamp_secs: AtomicU64,
@@ -226,6 +284,8 @@ impl IndexState {
                 let (sender, _) = broadcast::channel(512);
                 sender
             },
+            paper_house_publishers: DashMap::new(),
+            paper_house_dirty: DashSet::new(),
             orders: DashMap::new(),
             orders_by_id: DashMap::new(),
             orders_by_user: DashMap::new(),
@@ -239,7 +299,19 @@ impl IndexState {
             paper_instruments: DashMap::new(),
             paper_oi: DashMap::new(),
             paper_oi_history: DashMap::new(),
+            paper_house_history: DashMap::new(),
+            paper_queue_open: DashMap::new(),
             paper_volume: DashMap::new(),
+            paper_total_staker_rewards: DashMap::new(),
+            paper_rewards_claimed: DashMap::new(),
+            paper_activity: Mutex::new(VecDeque::new()),
+            paper_activity_publisher: {
+                let (sender, _) = broadcast::channel(512);
+                sender
+            },
+            paper_stake_dirty: DashSet::new(),
+            paper_stake_history: DashMap::new(),
+            paper_stake_publishers: DashMap::new(),
             persist,
             indexing_block_timestamp_secs: AtomicU64::new(0),
         }
@@ -281,8 +353,237 @@ impl IndexState {
         self.paper_instruments.clear();
         self.paper_oi.clear();
         self.paper_oi_history.clear();
+        self.paper_house_history.clear();
+        self.paper_queue_open.clear();
         self.paper_volume.clear();
+        self.paper_total_staker_rewards.clear();
+        self.paper_rewards_claimed.clear();
+        if let Ok(mut q) = self.paper_activity.lock() {
+            q.clear();
+        }
+        self.paper_stake_dirty.clear();
+        self.paper_stake_history.clear();
+        self.paper_stake_publishers.clear();
+        self.paper_house_dirty.clear();
         self.indexing_block_timestamp_secs.store(0, Ordering::Relaxed);
+    }
+
+    pub fn push_paper_activity(&self, mut item: PaperActivityItem) {
+        if item.ts_ms == 0 {
+            item.ts_ms = self.indexing_block_timestamp_ms();
+            if item.ts_ms == 0 {
+                item.ts_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+            }
+        }
+        if let Ok(mut q) = self.paper_activity.lock() {
+            q.push_back(item.clone());
+            while q.len() > PAPER_ACTIVITY_LIMIT {
+                q.pop_front();
+            }
+        }
+        let _ = self.paper_activity_publisher.send(PaperActivityWsMessage {
+            msg_type: "paper_activity".into(),
+            activity: item,
+        });
+    }
+
+    pub fn paper_activity(&self, market: Option<&str>, limit: usize) -> Vec<PaperActivityItem> {
+        let limit = limit.clamp(1, PAPER_ACTIVITY_LIMIT);
+        let market_key = market.map(addr_key);
+        let Ok(q) = self.paper_activity.lock() else {
+            return Vec::new();
+        };
+        q.iter()
+            .rev()
+            .filter(|a| {
+                market_key
+                    .as_ref()
+                    .map(|m| addr_key(&a.market) == *m)
+                    .unwrap_or(true)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    pub fn subscribe_paper_activity(&self) -> broadcast::Receiver<PaperActivityWsMessage> {
+        self.paper_activity_publisher.subscribe()
+    }
+
+    pub fn mark_paper_stake_dirty(&self, market: &str) {
+        let key = addr_key(market);
+        if !key.is_empty() {
+            self.paper_stake_dirty.insert(key);
+        }
+    }
+
+    fn record_paper_stake_tick(&self, market: &str, tick: PaperStakeTick) {
+        let key = addr_key(market);
+        let mut hist = self
+            .paper_stake_history
+            .entry(key)
+            .or_insert_with(VecDeque::new);
+        if let Some(last) = hist.back() {
+            if last.ts_ms == tick.ts_ms {
+                *hist.back_mut().unwrap() = tick;
+                return;
+            }
+        }
+        hist.push_back(tick);
+        while hist.len() > PAPER_STAKE_HISTORY_LIMIT {
+            hist.pop_front();
+        }
+    }
+
+    fn paper_stake_publisher(&self, market: &str) -> broadcast::Sender<PaperStakeWsMessage> {
+        let key = addr_key(market);
+        self.paper_stake_publishers
+            .entry(key)
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(64);
+                sender
+            })
+            .clone()
+    }
+
+    pub fn subscribe_paper_stake(&self, market: &str) -> broadcast::Receiver<PaperStakeWsMessage> {
+        self.paper_stake_publisher(market).subscribe()
+    }
+
+    pub fn paper_stake_history(
+        &self,
+        market: &str,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> Vec<PaperStakeTick> {
+        let key = addr_key(market);
+        let limit = limit.clamp(1, PAPER_STAKE_HISTORY_LIMIT);
+        let Some(hist) = self.paper_stake_history.get(&key) else {
+            return Vec::new();
+        };
+        hist.iter()
+            .filter(|t| from_ms.map(|f| t.ts_ms >= f).unwrap_or(true))
+            .cloned()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
+    /// Sample live stake metrics for dirty markets (needs chain for supply / reward_pool).
+    pub async fn flush_paper_stake_history(&self, chain: &SharedChainClient, publish: bool) {
+        let markets: Vec<String> = self
+            .paper_stake_dirty
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        if markets.is_empty() {
+            return;
+        }
+        self.paper_stake_dirty.clear();
+        let mut ts_ms = self.indexing_block_timestamp_ms();
+        if ts_ms == 0 {
+            ts_ms = wall_clock_ms();
+        }
+        for market in markets {
+            let Ok(paper_market) = parse_token_contract(&market) else {
+                continue;
+            };
+            let paper_token = match chain.get_paper_market(paper_market).await {
+                Ok(m) => m.paper_token,
+                Err(err) => {
+                    tracing::debug!(error = %err, %market, "flush stake history get_mkt failed");
+                    None
+                }
+            };
+            let total_paper_supply = if let Some(token) = paper_token {
+                match chain.get_token_info(Address::ZERO, token).await {
+                    Ok(info) => info.total_supply,
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+            let staking_revenue = match chain
+                .get_paper_stake(Address::ZERO, paper_market)
+                .await
+            {
+                Ok(s) => s.reward_pool,
+                Err(_) => 0,
+            };
+            let total_staking_reward = self.paper_total_staker_rewards(&market);
+            let tick = PaperStakeTick {
+                ts_ms,
+                staking_revenue,
+                total_paper_supply,
+                total_staking_reward,
+            };
+            self.record_paper_stake_tick(&market, tick.clone());
+            if publish {
+                let _ = self.paper_stake_publisher(&market).send(PaperStakeWsMessage {
+                    msg_type: "paper_stake".into(),
+                    market: market.clone(),
+                    ts_ms: tick.ts_ms,
+                    staking_revenue: format_token_amount(tick.staking_revenue),
+                    staking_revenue_raw: tick.staking_revenue,
+                    total_paper_supply: format_token_amount(tick.total_paper_supply),
+                    total_paper_supply_raw: tick.total_paper_supply,
+                    total_staking_reward: format_token_amount(tick.total_staking_reward),
+                    total_staking_reward_raw: tick.total_staking_reward,
+                    stake: None,
+                });
+            }
+        }
+    }
+
+    fn paper_rewards_claimed_key(market: &str, user: &str) -> String {
+        format!("{}:{}", addr_key(market), addr_key(user))
+    }
+
+    pub fn apply_paper_fees_pushed_rewards(
+        &self,
+        market: &str,
+        staker_fee: u64,
+        swept: u64,
+    ) {
+        let add = staker_fee.saturating_add(swept);
+        if add == 0 {
+            return;
+        }
+        self.paper_total_staker_rewards
+            .entry(addr_key(market))
+            .and_modify(|v| *v = v.saturating_add(add))
+            .or_insert(add);
+    }
+
+    pub fn apply_paper_claimed_reward(&self, market: &str, user: &str, reward: u64) {
+        if reward == 0 {
+            return;
+        }
+        let key = Self::paper_rewards_claimed_key(market, user);
+        self.paper_rewards_claimed
+            .entry(key)
+            .and_modify(|v| *v = v.saturating_add(reward))
+            .or_insert(reward);
+    }
+
+    pub fn paper_total_staker_rewards(&self, market: &str) -> u64 {
+        self.paper_total_staker_rewards
+            .get(&addr_key(market))
+            .map(|v| *v)
+            .unwrap_or(0)
+    }
+
+    pub fn paper_rewards_claimed(&self, market: &str, user: &str) -> u64 {
+        self.paper_rewards_claimed
+            .get(&Self::paper_rewards_claimed_key(market, user))
+            .map(|v| *v)
+            .unwrap_or(0)
     }
 
     fn paper_position_key(market: &str, position: u64) -> String {
@@ -307,7 +608,14 @@ impl IndexState {
             Some(row.instrument),
             Some(row.is_long),
             Some(row.bust_price_raw),
+            Some(row.notional.clone()),
+            Some(row.notional_raw),
+            Some(row.entry_price.clone()),
+            Some(row.entry_price_raw),
+            None,
+            None,
         );
+        self.mark_paper_house_dirty(&row.market);
         self.paper_positions_open.insert(key, row);
     }
 
@@ -320,6 +628,332 @@ impl IndexState {
 
     pub fn apply_paper_house_after(&self, market: &str, house: PaperHouseAfter) {
         self.paper_house.insert(addr_key(market), house);
+        self.mark_paper_house_dirty(market);
+    }
+
+    fn paper_queue_key(market: &str, index: u64) -> String {
+        format!("{}:{}", addr_key(market), index)
+    }
+
+    pub fn apply_paper_queued(
+        &self,
+        market: &str,
+        index: u64,
+        user: &str,
+        amount: u64,
+        house: PaperHouseAfter,
+    ) {
+        let block_ms = self.indexing_block_timestamp_ms();
+        let queued_at_ms = if block_ms > 0 {
+            block_ms
+        } else {
+            wall_clock_ms()
+        };
+        self.paper_queue_open.insert(
+            Self::paper_queue_key(market, index),
+            PaperQueueClaim {
+                market: market.to_string(),
+                index,
+                user: user_key(user),
+                amount,
+                queued_at_ms,
+            },
+        );
+        self.apply_paper_house_after(market, house);
+    }
+
+    pub fn apply_paper_harvested(
+        &self,
+        market: &str,
+        index: u64,
+        house: PaperHouseAfter,
+    ) {
+        self.paper_queue_open
+            .remove(&Self::paper_queue_key(market, index));
+        self.apply_paper_house_after(market, house);
+    }
+
+    fn paper_queue_claims_for_market(&self, market: &str) -> Vec<PaperQueueClaim> {
+        let market_key = addr_key(market);
+        let mut claims: Vec<PaperQueueClaim> = self
+            .paper_queue_open
+            .iter()
+            .filter(|e| addr_key(&e.value().market) == market_key)
+            .map(|e| e.value().clone())
+            .collect();
+        claims.sort_by_key(|c| c.index);
+        claims
+    }
+
+    pub async fn paper_queue_placement(
+        &self,
+        market: &str,
+        owner: &str,
+    ) -> crate::domain::PaperQueuePlacement {
+        use crate::chain::format_token_amount;
+        use crate::domain::PaperQueuePlacement;
+
+        let owner = user_key(owner);
+        let claims = self.paper_queue_claims_for_market(market);
+        let total: u64 = claims.iter().map(|c| c.amount).sum();
+        let your_entries = claims.iter().filter(|c| c.user == owner).count() as u32;
+        let yours_raw: u64 = claims
+            .iter()
+            .filter(|c| c.user == owner)
+            .map(|c| c.amount)
+            .sum();
+        let first_yours = claims
+            .iter()
+            .filter(|c| c.user == owner)
+            .map(|c| c.index)
+            .min();
+        let (ahead_raw, behind_raw) = match first_yours {
+            Some(first) => {
+                let ahead_raw: u64 = claims
+                    .iter()
+                    .filter(|c| c.index < first)
+                    .map(|c| c.amount)
+                    .sum();
+                let behind_raw = total
+                    .saturating_sub(ahead_raw)
+                    .saturating_sub(yours_raw);
+                (ahead_raw, behind_raw)
+            }
+            None => (0, total),
+        };
+
+        PaperQueuePlacement {
+            market: market.to_string(),
+            address: owner,
+            ahead: format_token_amount(ahead_raw),
+            ahead_raw,
+            yours: format_token_amount(yours_raw),
+            yours_raw,
+            behind: format_token_amount(behind_raw),
+            behind_raw,
+            your_entries,
+            in_queue: your_entries > 0,
+        }
+    }
+
+    fn push_paper_house_history(&self, market: &str, ts_ms: u64, house: &PaperHouseView) {
+        let key = addr_key(market);
+        if key.is_empty() {
+            return;
+        }
+        let tick = PaperHouseTick {
+            ts_ms,
+            house_funds: house.house_funds_raw,
+            lp_balance: house.lp_balance_raw,
+            open_house_pnl: house.open_house_pnl_raw,
+            queue_debt: house.queue_debt_raw,
+        };
+        let mut hist = self
+            .paper_house_history
+            .entry(key)
+            .or_insert_with(VecDeque::new);
+        if let Some(last) = hist.back() {
+            if last.ts_ms == ts_ms {
+                *hist.back_mut().expect("back exists") = tick;
+            } else {
+                hist.push_back(tick);
+            }
+        } else {
+            hist.push_back(tick);
+        }
+        while hist.len() > PAPER_HOUSE_HISTORY_LIMIT {
+            hist.pop_front();
+        }
+        if let Some(persist) = self.persist.as_ref() {
+            persist.enqueue_paper_house_history(PaperHouseHistoryRow {
+                market: market.to_string(),
+                ts_ms,
+                house_funds_raw: house.house_funds_raw,
+                lp_balance_raw: house.lp_balance_raw,
+                open_house_pnl_raw: house.open_house_pnl_raw,
+                queue_debt_raw: house.queue_debt_raw,
+            });
+        }
+    }
+
+    pub fn hydrate_paper_house_history_from_persist(&self) {
+        let Some(persist) = self.persist.as_ref() else {
+            return;
+        };
+        let markets = match persist.list_paper_house_history_markets() {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(error = %err, "load paper_house_history markets failed");
+                return;
+            }
+        };
+        let mut loaded = 0usize;
+        for market in markets {
+            let rows = match persist.load_paper_house_history(
+                &market,
+                None,
+                PAPER_HOUSE_HISTORY_LIMIT,
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(%market, error = %err, "load paper_house_history failed");
+                    continue;
+                }
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let key = addr_key(&market);
+            let mut hist = VecDeque::with_capacity(rows.len());
+            for row in rows {
+                hist.push_back(PaperHouseTick {
+                    ts_ms: row.ts_ms,
+                    house_funds: row.house_funds_raw,
+                    lp_balance: row.lp_balance_raw,
+                    open_house_pnl: row.open_house_pnl_raw,
+                    queue_debt: row.queue_debt_raw,
+                });
+            }
+            loaded = loaded.saturating_add(hist.len());
+            self.paper_house_history.insert(key, hist);
+        }
+        if loaded > 0 {
+            tracing::info!(ticks = loaded, "hydrated paper_house_history from sqlite");
+        }
+    }
+
+    pub async fn paper_house_history(
+        &self,
+        market: &str,
+        from_ms: Option<u64>,
+        limit: usize,
+    ) -> Vec<PaperHouseTick> {
+        let key = addr_key(market);
+        let limit = limit.clamp(1, PAPER_HOUSE_HISTORY_LIMIT);
+        if !self.paper_house_history.contains_key(&key) {
+            if let Some(persist) = self.persist.as_ref() {
+                if let Ok(rows) =
+                    persist.load_paper_house_history(market, from_ms, PAPER_HOUSE_HISTORY_LIMIT)
+                {
+                    if !rows.is_empty() {
+                        let mut hist = VecDeque::with_capacity(rows.len());
+                        for row in rows {
+                            hist.push_back(PaperHouseTick {
+                                ts_ms: row.ts_ms,
+                                house_funds: row.house_funds_raw,
+                                lp_balance: row.lp_balance_raw,
+                                open_house_pnl: row.open_house_pnl_raw,
+                                queue_debt: row.queue_debt_raw,
+                            });
+                        }
+                        self.paper_house_history.insert(key.clone(), hist);
+                    }
+                }
+            }
+        }
+        let Some(hist) = self.paper_house_history.get(&key) else {
+            return Vec::new();
+        };
+        let filtered: Vec<PaperHouseTick> = hist
+            .iter()
+            .filter(|t| from_ms.map(|f| t.ts_ms >= f).unwrap_or(true))
+            .cloned()
+            .collect();
+        if filtered.len() <= limit {
+            return filtered;
+        }
+        filtered[filtered.len() - limit..].to_vec()
+    }
+
+    pub fn mark_paper_house_dirty(&self, market: &str) {
+        let key = addr_key(market);
+        if !key.is_empty() {
+            self.paper_house_dirty.insert(key);
+        }
+    }
+
+    fn paper_house_publisher(&self, market: &str) -> broadcast::Sender<PaperHouseWsMessage> {
+        let key = addr_key(market);
+        self.paper_house_publishers
+            .entry(key)
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(64);
+                sender
+            })
+            .clone()
+    }
+
+    pub fn subscribe_paper_house(&self, market: &str) -> broadcast::Receiver<PaperHouseWsMessage> {
+        self.paper_house_publisher(market).subscribe()
+    }
+
+    pub async fn paper_house_ws(&self, market: &str) -> Option<PaperHouseWsMessage> {
+        let market = market.trim();
+        if market.is_empty() {
+            return None;
+        }
+        let mut ts_ms = self.indexing_block_timestamp_ms();
+        if ts_ms == 0 {
+            ts_ms = wall_clock_ms();
+        }
+        let house = self.paper_house_view(market).await;
+        Some(PaperHouseWsMessage {
+            msg_type: "paper_house".into(),
+            market: house.market.clone(),
+            ts_ms,
+            house,
+        })
+    }
+
+    pub fn clear_paper_house_dirty(&self) {
+        self.paper_house_dirty.clear();
+    }
+
+    /// Coalesce dirty markets: always record history (+ sqlite); WS only if `publish`.
+    pub async fn flush_paper_house_ws(&self, publish: bool) {
+        let markets: Vec<String> = self
+            .paper_house_dirty
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        if markets.is_empty() {
+            return;
+        }
+        self.paper_house_dirty.clear();
+        let mut ts_ms = self.indexing_block_timestamp_ms();
+        if ts_ms == 0 {
+            ts_ms = wall_clock_ms();
+        }
+        for market in markets {
+            let house = self.paper_house_view(&market).await;
+            self.push_paper_house_history(&market, ts_ms, &house);
+            if !publish {
+                continue;
+            }
+            let msg = PaperHouseWsMessage {
+                msg_type: "paper_house".into(),
+                market: house.market.clone(),
+                ts_ms,
+                house,
+            };
+            let _ = self.paper_house_publisher(&market).send(msg);
+        }
+    }
+
+    fn mark_paper_house_dirty_for_price_market(&self, price_market: &str) {
+        let price_key = normalize_spot_market_key(price_market);
+        if price_key.is_empty() {
+            return;
+        }
+        for entry in self.paper_instruments.iter() {
+            if entry.value().price_market != price_key {
+                continue;
+            }
+            let Some((market, _)) = entry.key().rsplit_once(':') else {
+                continue;
+            };
+            self.mark_paper_house_dirty(market);
+        }
     }
 
     pub fn upsert_paper_instrument(
@@ -516,6 +1150,18 @@ impl IndexState {
             .map(|v| *v)
             .unwrap_or(0);
 
+        let claims = self.paper_queue_claims_for_market(market);
+        let queue_debt_positions = claims.len() as u32;
+        let queue_largest_raw = claims.iter().map(|c| c.amount).max().unwrap_or(0);
+        let paid_next = claims
+            .iter()
+            .find(|c| c.index == snap.queue_head)
+            .or_else(|| claims.first());
+        let (queue_paid_next_raw, queue_paid_next_user) = match paid_next {
+            Some(c) => (c.amount, c.user.clone()),
+            None => (0, String::new()),
+        };
+
         PaperHouseView {
             market: market.to_string(),
             free_cash: format_token_amount(snap.free_cash),
@@ -547,6 +1193,20 @@ impl IndexState {
             open_house_pnl_raw: open_house_pnl_i64,
             queue_debt: format_token_amount(queue_debt_raw),
             queue_debt_raw,
+            queue_debt_positions,
+            queue_largest: if queue_largest_raw > 0 {
+                format_token_amount(queue_largest_raw)
+            } else {
+                String::new()
+            },
+            queue_largest_raw,
+            queue_paid_next: if queue_paid_next_raw > 0 {
+                format_token_amount(queue_paid_next_raw)
+            } else {
+                String::new()
+            },
+            queue_paid_next_raw,
+            queue_paid_next_user,
             house_funds: format_i128_token(house_funds_raw),
             house_funds_raw,
             volume: format_token_amount(volume_raw),
@@ -564,7 +1224,18 @@ impl IndexState {
         instrument: Option<u32>,
         is_long: Option<bool>,
         bust_price_raw: Option<u64>,
+        notional: Option<String>,
+        notional_raw: Option<u64>,
+        entry_price: Option<String>,
+        entry_price_raw: Option<u64>,
+        pnl: Option<String>,
+        pnl_raw: Option<i64>,
     ) {
+        let instrument_name = instrument.and_then(|id| {
+            self.paper_instruments
+                .get(&paper_instr_key(market, id))
+                .map(|m| m.name.clone())
+        });
         let _ = self.paper_user_publisher.send(PaperUserWsMessage {
             msg_type: "paper_user".into(),
             event: event.to_string(),
@@ -583,6 +1254,13 @@ impl IndexState {
             instrument,
             is_long,
             bust_price_raw,
+            notional,
+            notional_raw,
+            entry_price,
+            entry_price_raw,
+            instrument_name,
+            pnl,
+            pnl_raw,
         });
     }
 
@@ -606,41 +1284,56 @@ impl IndexState {
         queued: String,
         minted: String,
         pnl: String,
+        pnl_raw: i64,
         kind: PaperCloseKind,
         liquidator: Option<String>,
     ) {
         let key = Self::paper_position_key(market, position);
         let open = self.paper_positions_open.remove(&key).map(|(_, v)| v);
-        let (instrument, is_long, margin, notional, entry_price, bust_price, owner, opened_block) =
-            if let Some(o) = open {
-                self.apply_paper_oi_delta(
-                    market,
-                    o.instrument,
-                    o.is_long,
-                    -(o.notional_raw as i128),
-                );
-                (
-                    o.instrument,
-                    o.is_long,
-                    o.margin,
-                    o.notional,
-                    o.entry_price,
-                    o.bust_price,
-                    o.owner,
-                    o.opened_block,
-                )
-            } else {
-                (
-                    0,
-                    true,
-                    "0".into(),
-                    "0".into(),
-                    "0".into(),
-                    "0".into(),
-                    owner_fallback.to_string(),
-                    0,
-                )
-            };
+        let (
+            instrument,
+            is_long,
+            margin,
+            notional,
+            notional_raw,
+            entry_price,
+            entry_price_raw,
+            bust_price,
+            owner,
+            opened_block,
+        ) = if let Some(o) = open {
+            self.apply_paper_oi_delta(
+                market,
+                o.instrument,
+                o.is_long,
+                -(o.notional_raw as i128),
+            );
+            (
+                o.instrument,
+                o.is_long,
+                o.margin,
+                o.notional,
+                o.notional_raw,
+                o.entry_price,
+                o.entry_price_raw,
+                o.bust_price,
+                o.owner,
+                o.opened_block,
+            )
+        } else {
+            (
+                0,
+                true,
+                "0".into(),
+                "0".into(),
+                0,
+                "0".into(),
+                0,
+                "0".into(),
+                owner_fallback.to_string(),
+                0,
+            )
+        };
         let event = match kind {
             PaperCloseKind::Liquidated => "liquidated",
             PaperCloseKind::Closed => "closed",
@@ -654,7 +1347,14 @@ impl IndexState {
             Some(instrument),
             Some(is_long),
             None,
+            Some(notional.clone()),
+            Some(notional_raw),
+            Some(entry_price.clone()),
+            Some(entry_price_raw),
+            Some(pnl.clone()),
+            Some(pnl_raw),
         );
+        self.mark_paper_house_dirty(market);
         let hist = PaperPositionHistory {
             market: addr_key(market),
             position,
@@ -1493,6 +2193,7 @@ impl IndexState {
         let msg = Self::oracle_ws_message(&mark);
         self.oracle_marks.insert(key.clone(), mark);
         let _ = self.oracle_publisher(&key).send(msg);
+        self.mark_paper_house_dirty_for_price_market(&key);
     }
 
     pub async fn oracle_mark(&self, spot_market: &str) -> Option<OracleMark> {
