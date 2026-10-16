@@ -34,9 +34,18 @@ pub struct OrderRow {
 }
 
 fn write_throughput_config() -> DBOptions {
-    default_db_options()
-        .optimize_for_write_throughput()
-        .optimize_for_read(256)
+    let mut opt = default_db_options();
+    opt.options.set_write_buffer_size(8 * 1024 * 1024);
+    opt.options.set_max_write_buffer_number(2);
+    opt.options.set_max_write_buffer_size_to_maintain(0);
+    opt.set_block_options(8, 16 << 10)
+}
+
+fn indexer_global_options() -> typed_store::rocksdb::Options {
+    let mut options = default_db_options().options;
+    options.set_db_write_buffer_size(32 * 1024 * 1024);
+    options.set_max_total_wal_size(32 * 1024 * 1024);
+    options
 }
 
 fn meta_table_config() -> DBOptions {
@@ -95,7 +104,7 @@ impl IndexStateTables {
         Ok(Self::open_tables_read_write(
             path.to_path_buf(),
             MetricConf::new("clob-index-state"),
-            None,
+            Some(indexer_global_options()),
             None,
         ))
     }

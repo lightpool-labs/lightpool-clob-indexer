@@ -206,8 +206,6 @@ pub struct IndexState {
     vault_portfolio: DashMap<Uuid, HashMap<String, u64>>,
     /// Open paper positions keyed by `{market}:{position}`.
     paper_positions_open: DashMap<String, PaperPositionOpen>,
-    /// Closed / liquidated paper positions (append-only history).
-    paper_positions_history: DashMap<String, PaperPositionHistory>,
     /// Latest LP/queue snapshot from paper events (`PaperHouseAfter`), keyed by market.
     paper_house: DashMap<String, PaperHouseAfter>,
     /// Instrument meta from `paper_instrument_added`, keyed by `{market}:{instrument}`.
@@ -294,7 +292,6 @@ impl IndexState {
             vault_by_account: DashMap::new(),
             vault_portfolio: DashMap::new(),
             paper_positions_open: DashMap::new(),
-            paper_positions_history: DashMap::new(),
             paper_house: DashMap::new(),
             paper_instruments: DashMap::new(),
             paper_oi: DashMap::new(),
@@ -348,7 +345,6 @@ impl IndexState {
         self.vault_by_account.clear();
         self.vault_portfolio.clear();
         self.paper_positions_open.clear();
-        self.paper_positions_history.clear();
         self.paper_house.clear();
         self.paper_instruments.clear();
         self.paper_oi.clear();
@@ -606,6 +602,8 @@ impl IndexState {
             Some(row.bust_price_raw),
             Some(row.notional.clone()),
             Some(row.notional_raw),
+            Some(row.margin.clone()),
+            Some(row.margin_raw),
             Some(row.entry_price.clone()),
             Some(row.entry_price_raw),
             None,
@@ -1222,6 +1220,8 @@ impl IndexState {
         bust_price_raw: Option<u64>,
         notional: Option<String>,
         notional_raw: Option<u64>,
+        margin: Option<String>,
+        margin_raw: Option<u64>,
         entry_price: Option<String>,
         entry_price_raw: Option<u64>,
         pnl: Option<String>,
@@ -1252,6 +1252,8 @@ impl IndexState {
             bust_price_raw,
             notional,
             notional_raw,
+            margin,
+            margin_raw,
             entry_price,
             entry_price_raw,
             instrument_name,
@@ -1283,6 +1285,7 @@ impl IndexState {
         pnl_raw: i64,
         kind: PaperCloseKind,
         liquidator: Option<String>,
+        known_margin: Option<u64>,
     ) {
         let key = Self::paper_position_key(market, position);
         let open = self.paper_positions_open.remove(&key).map(|(_, v)| v);
@@ -1290,6 +1293,7 @@ impl IndexState {
             instrument,
             is_long,
             margin,
+            margin_raw,
             notional,
             notional_raw,
             entry_price,
@@ -1308,6 +1312,7 @@ impl IndexState {
                 o.instrument,
                 o.is_long,
                 o.margin,
+                o.margin_raw,
                 o.notional,
                 o.notional_raw,
                 o.entry_price,
@@ -1321,6 +1326,7 @@ impl IndexState {
                 0,
                 true,
                 "0".into(),
+                0,
                 "0".into(),
                 0,
                 "0".into(),
@@ -1329,6 +1335,11 @@ impl IndexState {
                 owner_fallback.to_string(),
                 0,
             )
+        };
+        let (margin, margin_raw) = match known_margin {
+            Some(raw) if raw > 0 => (format_token_amount(raw), raw),
+            _ if margin_raw > 0 => (margin, margin_raw),
+            _ => (margin, margin_raw),
         };
         let event = match kind {
             PaperCloseKind::Liquidated => "liquidated",
@@ -1345,11 +1356,14 @@ impl IndexState {
             None,
             Some(notional.clone()),
             Some(notional_raw),
+            Some(margin.clone()),
+            Some(margin_raw),
             Some(entry_price.clone()),
             Some(entry_price_raw),
             Some(pnl.clone()),
             Some(pnl_raw),
         );
+        let owner = user_key(&owner);
         self.mark_paper_house_dirty(market);
         let hist = PaperPositionHistory {
             market: addr_key(market),
@@ -1372,7 +1386,28 @@ impl IndexState {
             opened_block,
             closed_block,
         };
-        self.paper_positions_history.insert(key, hist);
+        if let Some(persist) = &self.persist {
+            persist.enqueue_paper_position_history(hist).await;
+        }
+    }
+
+    fn query_closed_history(
+        &self,
+        owner: Option<&str>,
+        market: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<PaperPositionHistory>, u32) {
+        let Some(persist) = &self.persist else {
+            return (Vec::new(), 0);
+        };
+        match persist.query_paper_position_history(owner, market, limit, offset) {
+            Ok(page) => page,
+            Err(err) => {
+                tracing::warn!(error = %err, "query paper position history failed");
+                (Vec::new(), 0)
+            }
+        }
     }
 
     pub async fn query_paper_positions(
@@ -1405,27 +1440,6 @@ impl IndexState {
                 .then(b.position.cmp(&a.position))
         });
 
-        let mut hist_rows: Vec<PaperPositionHistory> = self
-            .paper_positions_history
-            .iter()
-            .map(|e| e.value().clone())
-            .filter(|row| {
-                owner
-                    .as_ref()
-                    .map(|o| user_key(&row.owner) == *o)
-                    .unwrap_or(true)
-                    && market
-                        .as_ref()
-                        .map(|m| addr_key(&row.market) == *m)
-                        .unwrap_or(true)
-            })
-            .collect();
-        hist_rows.sort_by(|a, b| {
-            b.closed_block
-                .cmp(&a.closed_block)
-                .then(b.position.cmp(&a.position))
-        });
-
         match query.status {
             PaperPositionStatus::Open => {
                 let total = open_rows.len() as u32;
@@ -1433,21 +1447,26 @@ impl IndexState {
                 (page, Vec::new(), total)
             }
             PaperPositionStatus::Closed => {
-                let total = hist_rows.len() as u32;
-                let page = hist_rows.into_iter().skip(offset).take(limit).collect();
+                let (page, total) = self.query_closed_history(
+                    owner.as_deref(),
+                    market.as_deref(),
+                    limit,
+                    offset,
+                );
                 (Vec::new(), page, total)
             }
             PaperPositionStatus::All => {
                 let open_len = open_rows.len();
-                let total = (open_len + hist_rows.len()) as u32;
                 let page_open: Vec<_> = open_rows.into_iter().skip(offset).take(limit).collect();
                 let remain = limit.saturating_sub(page_open.len());
                 let hist_skip = offset.saturating_sub(open_len);
-                let page_hist: Vec<_> = hist_rows
-                    .into_iter()
-                    .skip(hist_skip)
-                    .take(remain)
-                    .collect();
+                let (page_hist, hist_total) = self.query_closed_history(
+                    owner.as_deref(),
+                    market.as_deref(),
+                    remain,
+                    hist_skip,
+                );
+                let total = (open_len as u32).saturating_add(hist_total);
                 (page_open, page_hist, total)
             }
         }

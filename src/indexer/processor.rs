@@ -384,7 +384,7 @@ pub async fn process_prepared_block(
     }
 
     if tx_count > 0 {
-        tracing::info!(
+        tracing::debug!(
             block_num,
             tx_count,
             ok_count,
@@ -689,7 +689,7 @@ async fn index_paper_opened(store: &SharedIndexState, opened: PaperOpenedEvent, 
     };
     store.apply_paper_house_after(&market, opened.house);
     store.upsert_paper_position_open(row).await;
-    tracing::info!(
+    tracing::debug!(
         market = %market,
         position = opened.position,
         owner = %opened.owner,
@@ -716,6 +716,7 @@ async fn index_paper_closed(store: &SharedIndexState, closed: PaperClosedEvent, 
             closed.pnl,
             PaperCloseKind::Closed,
             None,
+            None,
         )
         .await;
     // PAPER activity: losing closes that mint PAPER (or any negative PnL).
@@ -736,7 +737,7 @@ async fn index_paper_closed(store: &SharedIndexState, closed: PaperClosedEvent, 
     if closed.minted > 0 {
         store.mark_paper_stake_dirty(&market);
     }
-    tracing::info!(
+    tracing::debug!(
         market = %market,
         position = closed.position,
         owner = %closed.owner,
@@ -766,6 +767,7 @@ async fn index_paper_liquidated(
             -(liqd.margin as i64),
             PaperCloseKind::Liquidated,
             Some(liqd.liquidator.to_string()),
+            Some(liqd.margin),
         )
         .await;
     store.push_paper_activity(PaperActivityItem {
@@ -781,7 +783,7 @@ async fn index_paper_liquidated(
         ts_ms: 0,
     });
     store.mark_paper_stake_dirty(&market);
-    tracing::info!(
+    tracing::debug!(
         market = %market,
         position = liqd.position,
         owner = %liqd.owner,

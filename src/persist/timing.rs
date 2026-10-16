@@ -31,6 +31,7 @@ pub enum PersistOpKind {
     OrderHistory,
     ClosedBar,
     PaperHouseHistory,
+    PaperPositionHistory,
     IndexWrite,
 }
 
@@ -41,6 +42,7 @@ impl fmt::Display for PersistOpKind {
             PersistOpKind::OrderHistory => "history",
             PersistOpKind::ClosedBar => "bar",
             PersistOpKind::PaperHouseHistory => "paper_house",
+            PersistOpKind::PaperPositionHistory => "paper_position",
             PersistOpKind::IndexWrite => "index",
         };
         write!(f, "{name}")
@@ -54,6 +56,7 @@ impl PersistOpKind {
             PersistOp::UpsertOrderHistory(_) => PersistOpKind::OrderHistory,
             PersistOp::SaveClosedBar(_) => PersistOpKind::ClosedBar,
             PersistOp::SavePaperHouseHistory(_) => PersistOpKind::PaperHouseHistory,
+            PersistOp::SavePaperPositionHistory(_) => PersistOpKind::PaperPositionHistory,
             PersistOp::IndexWrite(_) => PersistOpKind::IndexWrite,
         }
     }

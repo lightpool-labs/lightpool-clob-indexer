@@ -4,6 +4,7 @@
 
 use lightpool_sdk::ReceiptBlock;
 
+use crate::domain::PaperPositionHistory;
 use crate::error::{AppError, AppResult};
 use crate::peer::encode_block_payload;
 use crate::spot_market::normalize_spot_market_key;
@@ -20,6 +21,7 @@ pub enum PersistOp {
     UpsertOrderHistory(PersistOrderRow),
     SaveClosedBar(ClosedBarRow),
     SavePaperHouseHistory(PaperHouseHistoryRow),
+    SavePaperPositionHistory(PaperPositionHistory),
     /// One block of index-state RocksDB deltas.
     IndexWrite(IndexWriteSet),
 }
@@ -44,6 +46,13 @@ pub enum EncodedPersistOp {
     },
     SaveClosedBar(ClosedBarRow),
     SavePaperHouseHistory(PaperHouseHistoryRow),
+    SavePaperPositionHistory {
+        market: String,
+        position: i64,
+        owner: String,
+        closed_block: i64,
+        payload: String,
+    },
 }
 
 pub(crate) fn encode_persist_op(op: PersistOp) -> AppResult<EncodedPersistOp> {
@@ -75,6 +84,18 @@ pub(crate) fn encode_persist_op(op: PersistOp) -> AppResult<EncodedPersistOp> {
         PersistOp::SaveClosedBar(bar) => Ok(EncodedPersistOp::SaveClosedBar(bar)),
         PersistOp::SavePaperHouseHistory(row) => {
             Ok(EncodedPersistOp::SavePaperHouseHistory(row))
+        }
+        PersistOp::SavePaperPositionHistory(row) => {
+            let payload = serde_json::to_string(&row).map_err(|e| {
+                AppError::Internal(format!("serialize paper position history: {e}"))
+            })?;
+            Ok(EncodedPersistOp::SavePaperPositionHistory {
+                market: row.market,
+                position: row.position as i64,
+                owner: row.owner,
+                closed_block: row.closed_block as i64,
+                payload,
+            })
         }
         PersistOp::IndexWrite(_) => Err(AppError::Internal(
             "index write must use dedicated index-write pipeline".into(),

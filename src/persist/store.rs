@@ -4,7 +4,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::domain::{Market, Order, Vault};
+use crate::domain::{Market, Order, PaperPositionHistory, Vault};
 use crate::error::{AppError, AppResult};
 use crate::spot_market::normalize_spot_market_key;
 
@@ -277,6 +277,17 @@ impl StateStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_order_history_user_ts
                     ON order_history(user_address, status_ts_ms DESC);
+
+                CREATE TABLE IF NOT EXISTS paper_position_history (
+                    market TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    owner TEXT NOT NULL,
+                    closed_block INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (market, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_position_history_owner
+                    ON paper_position_history(owner, market, closed_block DESC);
                 ",
             )
             .map_err(|e| AppError::Internal(format!("sqlite migrate state: {e}")))?;
@@ -570,6 +581,17 @@ impl StateStore {
                 .map_err(|e| {
                     AppError::Internal(format!("sqlite prepare paper_house_history batch: {e}"))
                 })?;
+            let mut position_stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO paper_position_history
+                     (market, position, owner, closed_block, payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| {
+                    AppError::Internal(format!(
+                        "sqlite prepare paper_position_history batch: {e}"
+                    ))
+                })?;
 
             for op in ops {
                 match op {
@@ -629,6 +651,21 @@ impl StateStore {
                             .map_err(|e| {
                                 AppError::Internal(format!(
                                     "sqlite batch paper_house_history: {e}"
+                                ))
+                            })?;
+                    }
+                    super::op::EncodedPersistOp::SavePaperPositionHistory {
+                        market,
+                        position,
+                        owner,
+                        closed_block,
+                        payload,
+                    } => {
+                        position_stmt
+                            .execute(params![market, position, owner, closed_block, payload])
+                            .map_err(|e| {
+                                AppError::Internal(format!(
+                                    "sqlite batch paper_position_history: {e}"
                                 ))
                             })?;
                     }
@@ -1130,5 +1167,72 @@ impl StateStore {
             });
         }
         Ok(out)
+    }
+
+    pub(crate) fn query_paper_position_history(
+        &self,
+        owner: Option<&str>,
+        market: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<(Vec<PaperPositionHistory>, u32)> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM paper_position_history
+                 WHERE (?1 IS NULL OR owner = ?1)
+                   AND (?2 IS NULL OR market = ?2)",
+                params![owner, market],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("sqlite count paper_position_history: {e}"))
+            })?;
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
+        if limit == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT payload FROM paper_position_history
+                 WHERE (?1 IS NULL OR owner = ?1)
+                   AND (?2 IS NULL OR market = ?2)
+                 ORDER BY closed_block DESC, position DESC
+                 LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("sqlite prepare paper_position_history: {e}"))
+            })?;
+        let rows = stmt
+            .query_map(params![owner, market, limit as i64, offset as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| {
+                AppError::Internal(format!("sqlite query paper_position_history: {e}"))
+            })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload =
+                row.map_err(|e| AppError::Internal(format!("sqlite paper_position_history row: {e}")))?;
+            let hist: PaperPositionHistory = serde_json::from_str(&payload).map_err(|e| {
+                AppError::Internal(format!("deserialize paper position history: {e}"))
+            })?;
+            out.push(hist);
+        }
+        Ok((out, total))
+    }
+
+    pub(crate) fn delete_paper_position_history_after(&self, block_num: u64) -> AppResult<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM paper_position_history WHERE closed_block > ?1",
+                params![block_num as i64],
+            )
+            .map_err(|e| {
+                AppError::Internal(format!("sqlite delete paper_position_history: {e}"))
+            })?;
+        Ok(n)
     }
 }

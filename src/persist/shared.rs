@@ -11,7 +11,7 @@ use lightpool_sdk::ReceiptBlock;
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 
-use crate::domain::{Market, Vault};
+use crate::domain::{Market, PaperPositionHistory, Vault};
 use crate::error::{AppError, AppResult};
 use crate::indexer::SharedIndexState;
 
@@ -29,7 +29,7 @@ use super::workers::PersistWorkers;
 #[derive(Clone)]
 pub struct SharedPersist {
     blocks: Arc<Mutex<BlockStore>>,
-    /// Sqlite for order_history / bars only.
+    /// Sqlite for order history, bars, and paper position history.
     state: Arc<Mutex<StateStore>>,
     /// RocksDB live index state (markets / orders / books / vaults).
     index: Arc<IndexStateStore>,
@@ -67,7 +67,8 @@ fn open_sqlite_conn(path: &Path) -> AppResult<Connection> {
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
         PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -65536;
+        PRAGMA cache_size = -8192;
+        PRAGMA mmap_size = 0;
         PRAGMA foreign_keys = ON;
         ",
     )
@@ -271,6 +272,12 @@ impl SharedPersist {
         self.submit_nowait(&self.history_tx, PersistOp::SavePaperHouseHistory(row));
     }
 
+    pub async fn enqueue_paper_position_history(&self, row: PaperPositionHistory) {
+        let tx = self.history_tx.clone();
+        self.submit_async(&tx, PersistOp::SavePaperPositionHistory(row))
+            .await;
+    }
+
     pub async fn enqueue_index_write(&self, ws: super::index_write_set::IndexWriteSet) {
         let Some(tx) = self.index_write_tx.as_ref() else {
             return;
@@ -398,6 +405,22 @@ impl SharedPersist {
         self.with_state(|store| store.list_paper_house_history_markets())
     }
 
+    pub fn query_paper_position_history(
+        &self,
+        owner: Option<&str>,
+        market: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<(Vec<PaperPositionHistory>, u32)> {
+        self.with_state(|store| {
+            store.query_paper_position_history(owner, market, limit, offset)
+        })
+    }
+
+    pub fn delete_paper_position_history_after(&self, block_num: u64) -> AppResult<usize> {
+        self.with_state(|store| store.delete_paper_position_history_after(block_num))
+    }
+
     pub fn upsert_order_history(&self, row: &PersistOrderRow) -> AppResult<()> {
         self.with_state(|store| store.upsert_order_history(row))
     }
@@ -523,6 +546,7 @@ impl SharedPersist {
         )?;
         // Drop any local blocks ahead of the peer snapshot before applying peer blocks.
         self.delete_blocks_after(snapshot.block_num)?;
+        self.delete_paper_position_history_after(snapshot.block_num)?;
         Ok(())
     }
 

@@ -39,6 +39,10 @@ pub struct PaperPositionWsMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notional_raw: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin_raw: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price_raw: Option<u64>,
