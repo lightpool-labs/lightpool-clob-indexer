@@ -9,8 +9,11 @@ use lightpool_sdk::{parse_token_contract, Address};
 
 use crate::book_hydrate::SharedChainClient;
 use crate::chain::format_token_amount;
-use crate::domain::PaperStakeView;
+use crate::domain::{
+    PaperAccountView, PaperPositionQuery, PaperPositionStatus, PaperStakeView,
+};
 use crate::indexer::IndexState;
+use crate::ws::models::PaperUserStateWsMessage;
 
 fn stake_share_pct(staked: u64, total_staked: u64) -> String {
     if total_staked == 0 || staked == 0 {
@@ -257,6 +260,73 @@ impl IndexState {
             total_staking_reward: format_token_amount(reward),
             total_staking_reward_raw: reward,
             stake: Some(stake),
+        })
+    }
+
+    pub async fn paper_user_state(
+        &self,
+        chain: &SharedChainClient,
+        user: &str,
+        market: &str,
+    ) -> Option<PaperUserStateWsMessage> {
+        let paper = self.paper_stake_view(chain, market, user).await?;
+        let address = Address::from_str(user).ok()?;
+        let market_addr = parse_token_contract(market).ok()?;
+        let acct = match chain.get_paper_account(address, market_addr).await {
+            Ok(acct) => acct,
+            Err(err) => {
+                tracing::warn!(error = %err, "paper user state account failed");
+                lightpool_sdk::lightpool_types::call::GetPaperAccount {
+                    available: 0,
+                    queued: 0,
+                    entry_head: 0,
+                    entry_tail: 0,
+                    queued_truncated: false,
+                }
+            }
+        };
+        let margin_in_use = self.sum_open_margin(user, Some(market)).await;
+        let open_positions = self.count_open_positions(user, Some(market)).await;
+        let available = format_token_amount(acct.available);
+        let queued = format_token_amount(acct.queued);
+        let margin = format_token_amount(margin_in_use);
+        let equity_raw = acct
+            .available
+            .saturating_add(acct.queued)
+            .saturating_add(margin_in_use);
+        let (positions, _, _) = self
+            .query_paper_positions(PaperPositionQuery {
+                owner: Some(user.to_string()),
+                market: Some(market.to_string()),
+                status: PaperPositionStatus::Open,
+                limit: 200,
+                offset: 0,
+            })
+            .await;
+        Some(PaperUserStateWsMessage {
+            msg_type: "paper.user.state".into(),
+            user_address: user.to_string(),
+            market: market.to_string(),
+            account: PaperAccountView {
+                market: market.to_string(),
+                address: user.to_string(),
+                available,
+                available_raw: acct.available,
+                queued,
+                queued_raw: acct.queued,
+                entry_head: acct.entry_head,
+                entry_tail: acct.entry_tail,
+                queued_truncated: acct.queued_truncated,
+                margin_in_use: margin,
+                margin_in_use_raw: margin_in_use,
+                open_pnl: "0".into(),
+                open_pnl_raw: 0,
+                equity: format_token_amount(equity_raw),
+                equity_raw: equity_raw as i64,
+                open_positions,
+            },
+            positions,
+            paper,
         })
     }
 }

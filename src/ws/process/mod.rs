@@ -19,9 +19,11 @@ pub use paper::{
     handle_subscribe_activity as subscribe_paper_activity,
     handle_subscribe_positions as subscribe_paper_positions,
     handle_subscribe_user as subscribe_paper_user,
+    handle_subscribe_user_state as subscribe_paper_user_state,
     handle_unsubscribe_activity as unsubscribe_paper_activity,
     handle_unsubscribe_positions as unsubscribe_paper_positions,
     handle_unsubscribe_user as unsubscribe_paper_user,
+    handle_unsubscribe_user_state as unsubscribe_paper_user_state,
 };
 pub use paper_house::{
     handle_subscribe as subscribe_paper_house, handle_unsubscribe as unsubscribe_paper_house,

@@ -9,6 +9,7 @@ pub const CHANNEL_USER: &str = "user";
 pub const CHANNEL_BARS: &str = "bars";
 pub const CHANNEL_ORACLE: &str = "oracle";
 pub const CHANNEL_PAPER_USER: &str = "paper.user";
+pub const CHANNEL_PAPER_USER_STATE: &str = "paper.user.state";
 pub const CHANNEL_PAPER_POSITIONS: &str = "paper.positions";
 pub const CHANNEL_PAPER_HOUSE: &str = "paper.house";
 pub const CHANNEL_PAPER_ACTIVITY: &str = "paper.activity";

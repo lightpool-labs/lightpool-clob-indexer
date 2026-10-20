@@ -24,6 +24,7 @@ pub enum SubscriptionKey {
     PaperPositions,
     PaperActivity,
     PaperStake(String),
+    PaperUserState(String),
     PaperHouse(String),
     Bars(String),
     Oracle(String),
@@ -254,6 +255,58 @@ impl WsSession {
             .insert(SubscriptionKey::PaperStake(market_key), handle);
     }
 
+    pub fn subscribe_paper_user_state(
+        &mut self,
+        state: crate::state::AppState,
+        user: String,
+        market: String,
+        mut user_rx: broadcast::Receiver<PaperUserWsMessage>,
+        mut stake_rx: broadcast::Receiver<PaperStakeWsMessage>,
+    ) {
+        let key = format!(
+            "{}|{}",
+            user.to_ascii_lowercase(),
+            market.to_ascii_lowercase()
+        );
+        self.cancel(SubscriptionKey::PaperUserState(key.clone()));
+        let outbound = self.outbound.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let refresh = tokio::select! {
+                    user_msg = user_rx.recv() => match user_msg {
+                        Ok(message) => {
+                            message.user_address.eq_ignore_ascii_case(&user)
+                                && message.market.eq_ignore_ascii_case(&market)
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => true,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                    stake_msg = stake_rx.recv() => match stake_msg {
+                        Ok(_) => true,
+                        Err(broadcast::error::RecvError::Lagged(_)) => true,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                };
+                if !refresh {
+                    continue;
+                }
+                let Some(snapshot) = state
+                    .index
+                    .paper_user_state(&state.chain, &user, &market)
+                    .await
+                else {
+                    continue;
+                };
+                let text = serde_json::to_string(&snapshot).unwrap_or_default();
+                if outbound.send(Message::Text(text.into())).is_err() {
+                    break;
+                }
+            }
+        });
+        self.tasks
+            .insert(SubscriptionKey::PaperUserState(key), handle);
+    }
+
     pub fn subscribe_paper_house(
         &mut self,
         market: String,
@@ -365,6 +418,15 @@ impl WsSession {
                 {
                     true
                 }
+                ("paper.user.state", Some(key), SubscriptionKey::PaperUserState(current))
+                    if current.eq_ignore_ascii_case(key)
+                        || current.to_ascii_lowercase().starts_with(&format!(
+                            "{}|",
+                            key.to_ascii_lowercase()
+                        )) =>
+                {
+                    true
+                }
                 ("paper.house", Some(market), SubscriptionKey::PaperHouse(current))
                     if current.eq_ignore_ascii_case(market) =>
                 {
@@ -388,6 +450,7 @@ impl WsSession {
                     "paper.positions" => matches!(subscription, SubscriptionKey::PaperPositions),
                     "paper.activity" => matches!(subscription, SubscriptionKey::PaperActivity),
                     "paper.stake" => matches!(subscription, SubscriptionKey::PaperStake(_)),
+                    "paper.user.state" => matches!(subscription, SubscriptionKey::PaperUserState(_)),
                     "paper.house" => matches!(subscription, SubscriptionKey::PaperHouse(_)),
                     "bars" => matches!(subscription, SubscriptionKey::Bars(_)),
                     "oracle" => matches!(subscription, SubscriptionKey::Oracle(_)),

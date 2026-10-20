@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use crate::domain::{PaperActivityItem, PaperHouseView, PaperStakeView};
+use crate::domain::{PaperAccountView, PaperActivityItem, PaperHouseView, PaperPositionOpen, PaperStakeView};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PaperUserWsMessage {
@@ -15,6 +15,17 @@ pub struct PaperUserWsMessage {
     pub market: String,
     pub position: u64,
     pub block_num: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaperUserStateWsMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub user_address: String,
+    pub market: String,
+    pub account: PaperAccountView,
+    pub positions: Vec<PaperPositionOpen>,
+    pub paper: PaperStakeView,
 }
 
 /// Fan-out for keepers (all opens); richer than per-user `paper.user`.

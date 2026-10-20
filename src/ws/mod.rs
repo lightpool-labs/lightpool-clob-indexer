@@ -22,8 +22,7 @@ use crate::state::AppState;
 use models::{
     ws_error, WsRequest, CHANNEL_BARS, CHANNEL_ORACLE, CHANNEL_ORDERBOOK_DELTA,
     CHANNEL_PAPER_ACTIVITY, CHANNEL_PAPER_HOUSE, CHANNEL_PAPER_POSITIONS, CHANNEL_PAPER_STAKE,
-    CHANNEL_PAPER_USER,
-    CHANNEL_QUOTE, CHANNEL_USER,
+    CHANNEL_PAPER_USER, CHANNEL_PAPER_USER_STATE, CHANNEL_QUOTE, CHANNEL_USER,
 };
 use process::WsSession;
 
@@ -154,6 +153,31 @@ async fn handle_request(
                     };
                     process::subscribe_paper_user(state, sender, session, &user_address).await
                 }
+                CHANNEL_PAPER_USER_STATE => {
+                    let Some(user_address) =
+                        request.user_address.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing user_address").into()))
+                            .await;
+                        return true;
+                    };
+                    let Some(market) = request.market.filter(|value| !value.trim().is_empty())
+                    else {
+                        let _ = sender
+                            .send(Message::Text(ws_error("missing market").into()))
+                            .await;
+                        return true;
+                    };
+                    process::subscribe_paper_user_state(
+                        state,
+                        sender,
+                        session,
+                        &user_address,
+                        &market,
+                    )
+                    .await
+                }
                 CHANNEL_PAPER_POSITIONS => {
                     process::subscribe_paper_positions(state, sender, session).await
                 }
@@ -266,6 +290,18 @@ async fn handle_request(
                         .as_deref()
                         .filter(|value| !value.trim().is_empty());
                     process::unsubscribe_paper_user(sender, session, user_address).await;
+                }
+                CHANNEL_PAPER_USER_STATE => {
+                    let user_address = request
+                        .user_address
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    let market = request
+                        .market
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty());
+                    process::unsubscribe_paper_user_state(sender, session, user_address, market)
+                        .await;
                 }
                 CHANNEL_PAPER_POSITIONS => {
                     process::unsubscribe_paper_positions(sender, session).await;
