@@ -84,6 +84,8 @@ pub struct PaperHouseView {
     pub staker_fee_acc_raw: u64,
     pub dev_fee_acc: String,
     pub dev_fee_acc_raw: u64,
+    pub buyback_cash: String,
+    pub buyback_cash_raw: u64,
     /// True when payout queue has unpaid claims (`total_queued > 0`).
     pub queue_nonempty: bool,
     /// User Positions: sum of long+short notional across instruments.
@@ -93,7 +95,7 @@ pub struct PaperHouseView {
     pub open_margin_raw: u64,
     pub open_positions: u32,
     pub instruments: Vec<PaperInstrumentExposure>,
-    /// Stats: free_cash + side_bucket.
+    /// Stats: free_cash + side_bucket + buyback_cash.
     pub lp_balance: String,
     pub lp_balance_raw: u64,
     /// Stats: −Σ trader unrealized PnL (house perspective).
@@ -196,6 +198,9 @@ pub struct PaperStakeView {
     /// USDC still in the staking reward pool (all stakers).
     pub reward_pool: String,
     pub reward_pool_raw: u64,
+    /// Quote reserved for PAPER buyback (half of excess sweep above staker_cap).
+    pub buyback_cash: String,
+    pub buyback_cash_raw: u64,
     pub total_staked: String,
     pub total_staked_raw: u64,
     /// User share of total_staked, e.g. "12.34" for 12.34%.
@@ -203,7 +208,7 @@ pub struct PaperStakeView {
     /// Lifetime USDC this user has claimed (`paper_claimed` sum).
     pub rewards_claimed: String,
     pub rewards_claimed_raw: u64,
-    /// Lifetime USDC distributed to stakers (`paper_fees_pushed` staker_fee+swept).
+    /// Lifetime USDC distributed to stakers (`paper_fees_pushed` staker_fee+swept_stakers).
     pub total_staker_rewards: String,
     pub total_staker_rewards_raw: u64,
     /// Mint-curve style display, e.g. `0% / 12% / 99%`.

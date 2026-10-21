@@ -147,9 +147,9 @@ impl IndexState {
             0
         };
 
-        let (tracked_lp, tail_hwm) = match chain.get_paper_lp(paper_market).await {
-            Ok(lp) => (lp.tracked_lp, lp.tail_hwm),
-            Err(_) => (0, 0),
+        let (tracked_lp, tail_hwm, buyback_cash) = match chain.get_paper_lp(paper_market).await {
+            Ok(lp) => (lp.tracked_lp, lp.tail_hwm, lp.buyback_cash),
+            Err(_) => (0, 0, 0),
         };
 
         let (staked, claimable, pending_reward, reward_pool, total_staked) =
@@ -188,6 +188,8 @@ impl IndexState {
             pending_reward_raw: pending_reward,
             reward_pool: format_token_amount(reward_pool),
             reward_pool_raw: reward_pool,
+            buyback_cash: format_token_amount(buyback_cash),
+            buyback_cash_raw: buyback_cash,
             total_staked: format_token_amount(total_staked),
             total_staked_raw: total_staked,
             stake_share_pct: stake_share_pct(staked, total_staked),

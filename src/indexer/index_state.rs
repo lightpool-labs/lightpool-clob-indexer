@@ -152,7 +152,7 @@ pub struct PaperStakeTick {
     pub staking_revenue: u64,
     /// PAPER token total supply.
     pub total_paper_supply: u64,
-    /// Lifetime USDC distributed to stakers (fees_pushed staker_fee+swept).
+    /// Lifetime USDC distributed to stakers (fees_pushed staker_fee+swept_stakers).
     pub total_staking_reward: u64,
 }
 
@@ -220,7 +220,7 @@ pub struct IndexState {
     paper_queue_open: DashMap<String, PaperQueueClaim>,
     /// Lifetime traded notional per paper market (sum of opened notional).
     paper_volume: DashMap<String, u64>,
-    /// Lifetime USDC pushed to stakers (`staker_fee + swept` from `paper_fees_pushed`).
+    /// Lifetime USDC pushed to stakers (`staker_fee + swept_stakers` from `paper_fees_pushed`).
     paper_total_staker_rewards: DashMap<String, u64>,
     /// Lifetime USDC claimed per `{market}:{user}` from `paper_claimed.reward`.
     paper_rewards_claimed: DashMap<String, u64>,
@@ -1065,6 +1065,7 @@ impl IndexState {
                 queue_tail: 0,
                 staker_fee_acc: 0,
                 dev_fee_acc: 0,
+                buyback_cash: 0,
             });
 
         let mut open_margin_raw = 0u64;
@@ -1133,7 +1134,10 @@ impl IndexState {
         }
         instruments.sort_by_key(|i| i.instrument);
 
-        let lp_balance_raw = snap.free_cash.saturating_add(snap.side_bucket);
+        let lp_balance_raw = snap
+            .free_cash
+            .saturating_add(snap.side_bucket)
+            .saturating_add(snap.buyback_cash);
         let queue_debt_raw = snap.total_queued;
         let house_funds_raw =
             (lp_balance_raw as i128) + open_house_pnl_raw - (queue_debt_raw as i128);
@@ -1174,6 +1178,8 @@ impl IndexState {
             staker_fee_acc_raw: snap.staker_fee_acc,
             dev_fee_acc: format_token_amount(snap.dev_fee_acc),
             dev_fee_acc_raw: snap.dev_fee_acc,
+            buyback_cash: format_token_amount(snap.buyback_cash),
+            buyback_cash_raw: snap.buyback_cash,
             queue_nonempty: snap.total_queued > 0,
             open_interest: format_token_amount(open_interest_raw),
             open_interest_raw,

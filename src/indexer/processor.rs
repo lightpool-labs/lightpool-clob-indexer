@@ -599,7 +599,7 @@ async fn apply_global_event(
                 store.apply_paper_fees_pushed_rewards(
                     &market,
                     pushed.staker_fee,
-                    pushed.swept,
+                    pushed.swept_stakers,
                 );
                 store.mark_paper_stake_dirty(&market);
                 store.apply_paper_house_after(&market, pushed.house);
